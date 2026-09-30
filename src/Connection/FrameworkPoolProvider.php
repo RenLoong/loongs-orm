@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace Loongs\Orm\Connection;
 
+use Loongs\Orm\Exceptions\PoolExhaustedException;
+
 /**
  * Glue to loongs/framework's Loongs\Database\DatabaseManager (Swoole PDOPool per worker,
  * booted in WorkerStart). Optional: the ORM does not require the framework.
@@ -34,23 +36,37 @@ final class FrameworkPoolProvider implements PoolProvider
 
     public function get(string $name): object
     {
-        return $this->manager()->connection($name);
+        try {
+            $pdo = $this->manager()->connection($name);
+        } catch (\RuntimeException $e) {
+            if (str_contains($e->getMessage(), 'exhausted') || $e instanceof \Loongs\Database\PoolExhaustedException) {
+                throw new PoolExhaustedException($e->getMessage(), 0, $e);
+            }
+            throw $e;
+        }
+        if (!is_object($pdo)) { // older framework: Channel::pop() timeout returns false
+            throw new PoolExhaustedException("Database pool [{$name}] exhausted: no connection freed within its wait_timeout.");
+        }
+
+        return $pdo;
     }
 
-    public function put(string $name, object $pdo, bool $healthy): void
+    public function put(string $name, object $pdo): void
+    {
+        $this->manager()->put($pdo, $name);
+    }
+
+    public function discard(string $name, object $pdo): void
     {
         $db = $this->manager();
-        if (!$healthy && method_exists($db, 'discard')) {
-            $db->discard($name);
+        if (method_exists($db, 'discard')) {
+            $db->discard($pdo, $name);
             return;
         }
-        if (!$healthy) {
-            try {
-                if ($pdo->inTransaction()) {
-                    $pdo->rollBack();
-                }
-            } catch (\Throwable) {
-            }
+        // framework without discard(): best effort — roll back and return it (PDOProxy reconnects on use)
+        try {
+            $pdo->inTransaction() && $pdo->rollBack();
+        } catch (\Throwable) {
         }
         $db->put($pdo, $name);
     }

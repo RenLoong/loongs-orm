@@ -9,9 +9,9 @@ use InvalidArgumentException;
 /**
  * Immutable description of "which database" a query runs against.
  *
- * - named:  a connection from config/database.php ("mysql", "central" …). May be served by a pool.
- * - ad-hoc: a raw config array or DSN (e.g. a tenant database). Never pooled unless the opt-in
- *           tenant pool is enabled.
+ * - named:  a connection from config/database.php ("mysql", "central" …). Framework PDOPool when
+ *           booted, else the ORM pool.
+ * - ad-hoc: a raw config array or DSN (e.g. a tenant database). ORM pool, bucket per fingerprint().
  *
  * $key identifies the target: "name:<name>" or "adhoc:<sha1 of the normalised config incl. credentials>".
  * Two configs share a key only if every connection parameter is identical.
@@ -90,6 +90,18 @@ final readonly class ConnectionConfig
         $cfg['password'] = $password ?? '';
 
         return self::adhoc($cfg);
+    }
+
+    /** Pool bucket identity: the full normalised config incl. credentials (named configs too). */
+    public function fingerprint(): string
+    {
+        if ($this->name === null) {
+            return $this->key;
+        }
+        $fp = $this->config;
+        ksort($fp);
+
+        return $this->key . ':' . sha1(json_encode($fp, JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE));
     }
 
     public function isNamed(): bool

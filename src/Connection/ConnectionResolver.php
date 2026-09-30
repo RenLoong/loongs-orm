@@ -6,18 +6,26 @@ namespace Loongs\Orm\Connection;
 
 use InvalidArgumentException;
 use Loongs\Orm\Context;
+use Loongs\Orm\Query\Grammar\Grammar;
+use Swoole\Coroutine;
 use WeakMap;
+use WeakReference;
 
 /**
  * Turns a connection spec into a ConnectionConfig and hands out Leases.
  *
- * Holds NO per-tenant state: no connection / PDO is memoised by name or config. Every lease is
- * either borrowed from a pool of a *named* connection (and put back on release) or a brand-new
- * PDO (closed on release). The only exception is the opt-in TenantPool (off by default).
+ * Every connection comes from a pool and goes back to the same pool:
+ *  - named connection + framework PDOPool booted in this worker → the framework pool;
+ *  - anything else (tenant array / DSN, or a named config without a booted framework pool) → the
+ *    ORM TenantPool, one bounded bucket per full config fingerprint (credentials included).
+ * Outside the pools nothing holds a PDO: handles and models keep a ConnectionConfig only; leases
+ * live for one statement, one transaction, or one acquire()/using() block.
  */
 final class ConnectionResolver
 {
     public const string TENANT_KEY = 'loongs.orm.tenant';
+
+    public const string HELD_KEY = 'loongs.orm.held';
 
     /** @var array<string, mixed>|\Closure(): array<string, mixed>|null ['default' => …, 'connections' => […]] */
     private array|\Closure|null $database = null;
@@ -26,7 +34,9 @@ final class ConnectionResolver
 
     private bool $autoFramework = true;
 
-    private ?TenantPool $tenantPool = null;
+    private ?TenantPool $pool = null;
+
+    private ?PoolConfig $poolConfig = null;
 
     /** @var WeakMap<object, int> identity serial per PDO object (diagnostics; weak → no retention) */
     private WeakMap $serials;
@@ -50,14 +60,32 @@ final class ConnectionResolver
         $this->autoFramework = $autoFramework;
     }
 
-    public function enableTenantPool(?TenantPool $pool): void
+    /** Replace the ORM pool settings (idle connections of the previous pool are closed). */
+    public function configurePool(PoolConfig $config): void
     {
-        $this->tenantPool = $pool;
+        $this->poolConfig = $config;
+        $this->pool?->flush();
+        $this->pool = null;
     }
 
-    public function tenantPool(): ?TenantPool
+    /** The ORM pool of this process, created on first use from the resolved PoolConfig. */
+    public function pool(): TenantPool
     {
-        return $this->tenantPool;
+        return $this->pool ??= new TenantPool(
+            $this->resolvePoolConfig(),
+            static fn (ConnectionConfig $c): object => PdoFactory::make($c),
+            fn (object $pdo): int => $this->serialOf($pdo),
+        );
+    }
+
+    public function resolvePoolConfig(): PoolConfig
+    {
+        if ($this->poolConfig !== null) {
+            return $this->poolConfig;
+        }
+        $fromConfig = $this->databaseConfig()['tenant_pool'] ?? [];
+
+        return PoolConfig::fromArray(array_replace(PoolConfig::envOverrides(), is_array($fromConfig) ? $fromConfig : []));
     }
 
     /**
@@ -98,7 +126,7 @@ final class ConnectionResolver
         return is_string($d) && $d !== '' ? $d : 'mysql';
     }
 
-    /** Borrow a connection for one statement / one transaction. */
+    /** Check a connection out of the right pool (one statement, one transaction or one acquire()). */
     public function lease(ConnectionConfig $c): Lease
     {
         $pools = $this->poolProvider();
@@ -106,39 +134,77 @@ final class ConnectionResolver
             $name = $c->name;
             $pdo = $pools->get($name);
 
-            return new Lease($pdo, $c, LeaseSource::Pool, $this->serialOf($pdo), static function (object $pdo, bool $healthy) use ($pools, $name): void {
-                $pools->put($name, $pdo, $healthy);
+            return new Lease($pdo, $c, LeaseSource::Framework, $this->serialOf($pdo), static function (object $pdo, bool $reusable) use ($pools, $name): void {
+                $reusable ? $pools->put($name, $pdo) : $pools->discard($name, $pdo);
             });
         }
 
-        $tp = $c->name === null ? $this->tenantPool : null;
-        if ($tp !== null) {
-            while (($item = $tp->take($c)) !== null) {
-                if ($tp->validate($c, $item['pdo'])) {
-                    return new Lease($item['pdo'], $c, LeaseSource::TenantPool, $item['serial'], static function (object $pdo, bool $healthy) use ($tp, $c, $item): void {
-                        $tp->give($c, $pdo, $item['serial'], $healthy);
-                    });
-                }
-                $tp->discarded++;
-            }
-            $pdo = PdoFactory::make($c);
-            $serial = $this->serialOf($pdo);
+        return $this->pool()->acquire($c);
+    }
 
-            return new Lease($pdo, $c, LeaseSource::TenantPool, $serial, static function (object $pdo, bool $healthy) use ($tp, $c, $serial): void {
-                $tp->give($c, $pdo, $serial, $healthy);
-            });
+    /**
+     * Take a lease for manual control (Orm::acquire / Orm::using). Nested acquires of the same config
+     * in the same coroutine share one lease (reference counted); it is the coroutine's ambient
+     * connection for that config until the last handle releases it.
+     */
+    public function acquire(ConnectionConfig $c, Grammar $grammar): Connection
+    {
+        $held = $this->held($c);
+        if ($held === null) {
+            $lease = $this->lease($c);
+            $held = new HeldLease($lease);
+            $all = Context::get(self::HELD_KEY);
+            $all = is_array($all) ? $all : [];
+            $all[$c->key] = WeakReference::create($held);
+            Context::set(self::HELD_KEY, $all);
+            self::deferReclaim($lease);
         }
+        $held->refs++;
 
-        $pdo = PdoFactory::make($c);
+        return new Connection($this, $c, $grammar, $held);
+    }
 
-        // Fresh: nothing keeps the PDO after release → it is closed when the lease drops it.
-        return new Lease($pdo, $c, LeaseSource::Fresh, $this->serialOf($pdo), static function (object $pdo, bool $healthy): void {
-            if (!$healthy) {
-                try {
-                    $pdo->inTransaction() && $pdo->rollBack();
-                } catch (\Throwable) {
-                }
-            }
+    /** The lease acquired for $c by this coroutine, if any. */
+    public function held(ConnectionConfig $c): ?HeldLease
+    {
+        $all = Context::get(self::HELD_KEY);
+        $held = is_array($all) && isset($all[$c->key]) ? $all[$c->key]->get() : null;
+
+        return $held instanceof HeldLease && !$held->lease->isReleased() ? $held : null;
+    }
+
+    /** Drop one reference; the last one returns the lease to its pool. */
+    public function releaseHeld(HeldLease $held, bool $broken = false): void
+    {
+        if ($broken) {
+            $held->lease->markBroken();
+        }
+        if (--$held->refs > 0) {
+            return;
+        }
+        $key = $held->lease->config->key;
+        $all = Context::get(self::HELD_KEY);
+        if (is_array($all) && isset($all[$key]) && $all[$key]->get() === $held) {
+            unset($all[$key]);
+            $all === [] ? Context::forget(self::HELD_KEY) : Context::set(self::HELD_KEY, $all);
+        }
+        $tx = Context::get(Connection::TX_KEY);
+        if (is_array($tx) && isset($tx[$key]) && $tx[$key]->lease === $held->lease) {
+            unset($tx[$key]); // an unfinished transaction on this lease: release() rolls it back
+            $tx === [] ? Context::forget(Connection::TX_KEY) : Context::set(Connection::TX_KEY, $tx);
+        }
+        $held->lease->release();
+    }
+
+    /** Safety net: reclaim $lease (with a WARN) if it is still out when the current coroutine ends. */
+    public static function deferReclaim(Lease $lease): void
+    {
+        if (!Context::inCoroutine()) {
+            return;
+        }
+        $ref = WeakReference::create($lease);
+        Coroutine::defer(static function () use ($ref): void {
+            $ref->get()?->reclaim('returned when its coroutine ended', true);
         });
     }
 
@@ -153,7 +219,7 @@ final class ConnectionResolver
             return $this->pools;
         }
         if ($this->autoFramework && FrameworkPoolProvider::available()) {
-            return new FrameworkPoolProvider();
+            return new FrameworkPoolProvider(); // stateless; resolves db() on each call
         }
 
         return null;

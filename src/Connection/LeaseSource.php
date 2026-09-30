@@ -6,10 +6,8 @@ namespace Loongs\Orm\Connection;
 
 enum LeaseSource: string
 {
-    /** Borrowed from a pool of a named connection (framework PDOPool). */
+    /** loongs/framework PDOPool of a named connection (booted in the worker). */
+    case Framework = 'framework';
+    /** ORM pool: tenant configs (array / DSN), or named configs when no framework pool is booted. */
     case Pool = 'pool';
-    /** New PDO created for this call, closed on release. */
-    case Fresh = 'fresh';
-    /** Opt-in bounded per-tenant pool (off by default). */
-    case TenantPool = 'tenant-pool';
 }

@@ -8,9 +8,11 @@ use Closure;
 use Loongs\Orm\Connection\Connection;
 use Loongs\Orm\Connection\ConnectionConfig;
 use Loongs\Orm\Connection\ConnectionResolver;
+use Loongs\Orm\Connection\PoolConfig;
 use Loongs\Orm\Connection\PoolProvider;
 use Loongs\Orm\Connection\QueryExecuted;
 use Loongs\Orm\Connection\TenantPool;
+use Loongs\Orm\Exceptions\QueryException;
 use Loongs\Orm\Query\Builder;
 use Loongs\Orm\Query\Expression;
 use Loongs\Orm\Query\Grammar\Grammar;
@@ -21,9 +23,10 @@ use Swoole\Coroutine;
  * Entry point.
  *
  * Process-wide state kept here is configuration only (named connection configs, grammar
- * factories, query listeners, the optional pool provider). No tenant, connection or PDO is
- * remembered: Orm::connection() returns a new lightweight handle on every call and each statement
- * borrows / releases its own connection.
+ * factories, query listeners, pool settings). No tenant or PDO is remembered outside the pools:
+ * Orm::connection() returns a new lightweight handle on every call and each statement checks a
+ * connection out of its pool (framework PDOPool for named connections, the ORM TenantPool for
+ * tenant configs) and returns it.
  */
 final class Orm
 {
@@ -34,6 +37,9 @@ final class Orm
 
     /** @var array<string, Closure(): Grammar> */
     private static array $grammars = [];
+
+    /** @var (callable(string): void)|null */
+    private static $warningHandler = null;
 
     public static function resolver(): ConnectionResolver
     {
@@ -57,25 +63,98 @@ final class Orm
         self::resolver()->setDatabaseConfig($database);
     }
 
-    /** Use $pools for named connections (null = never pool). Default: framework db() pools when booted. */
+    /** Pools for named connections (null = use the ORM pool for them too). Default: framework db() pools when booted. */
     public static function usePools(?PoolProvider $pools): void
     {
         self::resolver()->setPoolProvider($pools);
     }
 
-    /** OPT-IN bounded idle pool for ad-hoc tenant configs (OFF by default). See TenantPool. */
-    public static function enableTenantPool(int $maxTenants = 32, int $perTenant = 4, float $idleSeconds = 30.0): TenantPool
+    /**
+     * ORM pool settings (tenant configs; named configs when no framework pool is booted). Accepts a
+     * PoolConfig or ['size' => 8, 'max_tenants' => 64, 'idle_seconds' => 60, 'ttl' => 600,
+     * 'wait_timeout' => 3, 'validate' => true]. Without it: config('database.tenant_pool') → ORM_POOL_* env → defaults.
+     *
+     * @param PoolConfig|array<string, mixed> $config
+     */
+    public static function configurePool(PoolConfig|array $config): TenantPool
     {
-        $pool = new TenantPool($maxTenants, $perTenant, $idleSeconds);
-        self::resolver()->enableTenantPool($pool);
+        self::resolver()->configurePool(is_array($config) ? PoolConfig::fromArray($config) : $config);
 
-        return $pool;
+        return self::resolver()->pool();
     }
 
-    public static function disableTenantPool(): void
+    /** The ORM pool of this worker process. */
+    public static function pool(): TenantPool
     {
-        self::resolver()->tenantPool()?->flush();
-        self::resolver()->enableTenantPool(null);
+        return self::resolver()->pool();
+    }
+
+    /**
+     * Pool counters: totals, or open/active/idle/waiting for one spec.
+     *
+     * @param string|array<string, mixed>|ConnectionConfig|null $spec
+     * @return array<string, int>
+     */
+    public static function poolStats(string|array|ConnectionConfig|null $spec = null): array
+    {
+        return self::resolver()->pool()->stats($spec === null ? null : self::resolver()->spec($spec));
+    }
+
+    /**
+     * Check a connection out for manual control. Until release(), every statement on this config in
+     * the current coroutine (models, builders, Orm::table()) runs on it. release() is idempotent;
+     * exceptions do not release it — use try/finally, or Orm::using().
+     *
+     *   $c = Orm::acquire($tenant);
+     *   try { $c->table('users')->count(); User::on($tenant)->find(1); } finally { $c->release(); }
+     *
+     * @param string|array<string, mixed>|ConnectionConfig|null $spec
+     */
+    public static function acquire(string|array|ConnectionConfig|null $spec = null): Connection
+    {
+        $config = self::resolver()->spec($spec);
+
+        return self::resolver()->acquire($config, self::grammar($config->driver()));
+    }
+
+    /**
+     * acquire() + $callback($connection) + release, whatever happens: on an exception an open
+     * transaction is rolled back and a lost / broken connection is discarded instead of reused.
+     *
+     * @template T
+     * @param string|array<string, mixed>|ConnectionConfig|null $spec
+     * @param callable(Connection): T $callback
+     * @return T
+     */
+    public static function using(string|array|ConnectionConfig|null $spec, callable $callback): mixed
+    {
+        $c = self::acquire($spec);
+        try {
+            return $callback($c);
+        } catch (\Throwable $e) {
+            if (QueryException::causedByLostConnection($e)) {
+                $c->discard();
+            }
+            throw $e;
+        } finally {
+            $c->release();
+        }
+    }
+
+    /** Where safety-net warnings go (default: error_log). null restores the default. @param (callable(string): void)|null $handler */
+    public static function onWarning(?callable $handler): void
+    {
+        self::$warningHandler = $handler;
+    }
+
+    public static function warn(string $message): void
+    {
+        $h = self::$warningHandler;
+        if ($h !== null) {
+            $h($message);
+            return;
+        }
+        error_log('[loongs/orm] WARN ' . $message);
     }
 
     /**
