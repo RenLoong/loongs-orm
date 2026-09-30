@@ -14,14 +14,35 @@ use Loongs\Orm\Query\JoinClause;
  */
 abstract class Grammar
 {
+    /**
+     * Table prefix of the connection this grammar compiles for (set per Connection handle by
+     * Orm::grammar(); never shared). Applied to every table name and to the table segment of
+     * qualified columns ("posts.id" → `app_posts`.`id`), including aliases ("users as u" →
+     * `app_users` as `app_u`, so "u.id" → `app_u`.`id`). Expressions are never touched.
+     */
+    protected string $tablePrefix = '';
+
     /** Quote one identifier segment. */
     abstract public function wrapValue(string $value): string;
+
+    public function setTablePrefix(string $prefix): static
+    {
+        $this->tablePrefix = $prefix;
+
+        return $this;
+    }
+
+    public function getTablePrefix(): string
+    {
+        return $this->tablePrefix;
+    }
 
     public function compileRandom(): string
     {
         return 'RANDOM()';
     }
 
+    /** Column (or "table.column", "db.table.column", "col as alias"); the table segment gets the prefix. */
     public function wrap(string|Expression $value): string
     {
         if ($value instanceof Expression) {
@@ -30,13 +51,35 @@ abstract class Grammar
         if (preg_match('/^(.+?)\s+as\s+(.+)$/i', $value, $m)) {
             return $this->wrap($m[1]) . ' as ' . $this->wrapValue(trim($m[2]));
         }
+        $segments = explode('.', $value);
+        $last = count($segments) - 1;
+        $out = [];
+        foreach ($segments as $i => $seg) {
+            if ($seg === '*' && $i === $last) {
+                $out[] = '*';
+            } elseif ($last > 0 && $i === $last - 1) {
+                $out[] = $this->wrapValue($this->tablePrefix . $seg);   // table segment
+            } else {
+                $out[] = $this->wrapValue($seg);
+            }
+        }
 
-        return implode('.', array_map(fn (string $seg): string => $seg === '*' ? '*' : $this->wrapValue($seg), explode('.', $value)));
+        return implode('.', $out);
     }
 
+    /** Table name ("users", "db.users", "users as u"), prefixed. */
     public function wrapTable(string|Expression $table): string
     {
-        return $this->wrap($table);
+        if ($table instanceof Expression) {
+            return (string) $table;
+        }
+        if (preg_match('/^(.+?)\s+as\s+(.+)$/i', $table, $m)) {
+            return $this->wrapTable($m[1]) . ' as ' . $this->wrapValue($this->tablePrefix . trim($m[2]));
+        }
+        $segments = explode('.', $table);
+        $name = array_pop($segments);
+
+        return implode('.', [...array_map($this->wrapValue(...), $segments), $this->wrapValue($this->tablePrefix . $name)]);
     }
 
     /** @param list<string|Expression> $columns */

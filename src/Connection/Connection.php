@@ -99,6 +99,30 @@ final class Connection
         return $this->grammar;
     }
 
+    /** Table prefix of this connection ("" = none). */
+    public function prefix(): string
+    {
+        return $this->grammar->getTablePrefix();
+    }
+
+    /** Prefixed, unquoted table name: tableName('users') → "app_users". */
+    public function tableName(string $table): string
+    {
+        return $this->prefix() . $table;
+    }
+
+    /** Prefixed + quoted table for raw SQL: wrapTable('users') → `app_users` ("users as u" → `app_users` as `app_u`). */
+    public function wrapTable(string $table): string
+    {
+        return $this->grammar->wrapTable($table);
+    }
+
+    /** Quoted column for raw SQL, table segment prefixed: wrap('users.id') → `app_users`.`id`. */
+    public function wrap(string $column): string
+    {
+        return $this->grammar->wrap($column);
+    }
+
     public function table(string|Expression $table, ?string $as = null): Builder
     {
         return (new Builder($this))->from($table, $as);

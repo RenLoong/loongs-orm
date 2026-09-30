@@ -62,7 +62,7 @@ final class MySqlGrammar extends Grammar
         $table = $this->wrapTable($q->from ?? '');
         $where = $q->wheres !== [] ? ' where ' . $this->compileWheres($q) : '';
         if ($q->joins !== []) {
-            $alias = preg_match('/\s+as\s+(\S+)$/i', (string) $q->from, $m) ? $this->wrapValue($m[1]) : $table;
+            $alias = preg_match('/\s+as\s+(\S+)$/i', (string) $q->from, $m) ? $this->wrapValue($this->tablePrefix . $m[1]) : $table;
             $joins = implode(' ', array_map($this->compileJoin(...), $q->joins));
 
             return "delete {$alias} from {$table} {$joins}{$where}";

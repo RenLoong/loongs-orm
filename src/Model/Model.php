@@ -535,6 +535,18 @@ abstract class Model implements ArrayAccess, JsonSerializable, Stringable
         return Inflector::snake(Inflector::classBasename($this)) . '_' . $this->getKeyName();
     }
 
+    /** Table prefix of the connection this model resolves to right now (bound / declared / tenant scope / default). */
+    public function getTablePrefix(): string
+    {
+        return $this->getConnectionConfig()->prefix();
+    }
+
+    /** Physical table name (prefix + getTable()), unquoted — for raw SQL; the query builder adds the prefix itself. */
+    public function getPrefixedTable(): string
+    {
+        return $this->getTablePrefix() . $this->getTable();
+    }
+
     public function qualifyColumn(string $column): string
     {
         return str_contains($column, '.') ? $column : $this->getTable() . '.' . $column;

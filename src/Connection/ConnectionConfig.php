@@ -119,6 +119,45 @@ final readonly class ConnectionConfig
         return (string) ($this->config['database'] ?? '');
     }
 
+    /** Table prefix ("" = none): prepended to every table name the query builder / models compile. */
+    public function prefix(): string
+    {
+        return (string) ($this->config['prefix'] ?? '');
+    }
+
+    /** Prefixed table name (unquoted), e.g. table('users') → "app_users". */
+    public function table(string $table): string
+    {
+        return $this->prefix() . $table;
+    }
+
+    /** Storage engine from the config ("engine" key), or null when not configured (DDL helpers pick a default). */
+    public function engine(): ?string
+    {
+        return isset($this->config['engine']) ? (string) $this->config['engine'] : null;
+    }
+
+    public function charset(): string
+    {
+        return (string) ($this->config['charset'] ?? 'utf8mb4');
+    }
+
+    /** Collation from the config, or null when not configured. */
+    public function collation(): ?string
+    {
+        return isset($this->config['collation']) ? (string) $this->config['collation'] : null;
+    }
+
+    /**
+     * Table options for DDL: prefix, engine, charset, collation (null = not configured).
+     *
+     * @return array{prefix: string, engine: ?string, charset: string, collation: ?string}
+     */
+    public function tableOptions(): array
+    {
+        return ['prefix' => $this->prefix(), 'engine' => $this->engine(), 'charset' => $this->charset(), 'collation' => $this->collation()];
+    }
+
     /** Safe description (never includes the password). */
     public function describe(): string
     {
@@ -146,7 +185,7 @@ final readonly class ConnectionConfig
         ];
         if (isset($p['query'])) {
             parse_str($p['query'], $q);
-            foreach (['charset', 'unix_socket', 'collation'] as $k) {
+            foreach (['charset', 'unix_socket', 'collation', 'prefix', 'engine'] as $k) {
                 if (isset($q[$k]) && is_string($q[$k])) {
                     $cfg[$k] = $q[$k];
                 }
@@ -154,6 +193,15 @@ final readonly class ConnectionConfig
         }
 
         return $cfg;
+    }
+
+    private static function identifier(string $key, string $v): string
+    {
+        if (preg_match('/^[A-Za-z0-9_]{1,64}$/', $v) !== 1) {
+            throw new InvalidArgumentException("Connection \"{$key}\" may only contain [A-Za-z0-9_].");
+        }
+
+        return $v;
     }
 
     /**
@@ -178,7 +226,17 @@ final readonly class ConnectionConfig
             $out['dsn'] = $c['dsn'];
         }
         if (isset($c['collation']) && is_string($c['collation']) && $c['collation'] !== '') {
-            $out['collation'] = $c['collation'];
+            $out['collation'] = self::identifier('collation', $c['collation']);
+        }
+        $out['charset'] = self::identifier('charset', $out['charset']);
+        // table prefix / engine: kept (normalised connection configs used to drop them)
+        $prefix = (string) ($c['prefix'] ?? '');
+        if (preg_match('/^[A-Za-z0-9_]{0,64}$/', $prefix) !== 1) {
+            throw new InvalidArgumentException('Connection "prefix" may only contain [A-Za-z0-9_] (max 64).');
+        }
+        $out['prefix'] = $prefix;
+        if (isset($c['engine']) && is_string($c['engine']) && $c['engine'] !== '') {
+            $out['engine'] = self::identifier('engine', $c['engine']);
         }
 
         return $out;

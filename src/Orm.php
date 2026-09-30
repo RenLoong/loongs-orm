@@ -114,7 +114,7 @@ final class Orm
     {
         $config = self::resolver()->spec($spec);
 
-        return self::resolver()->acquire($config, self::grammar($config->driver()));
+        return self::resolver()->acquire($config, self::grammar($config->driver(), $config->prefix()));
     }
 
     /**
@@ -167,7 +167,36 @@ final class Orm
     {
         $config = self::resolver()->spec($spec);
 
-        return new Connection(self::resolver(), $config, self::grammar($config->driver()));
+        return new Connection(self::resolver(), $config, self::grammar($config->driver(), $config->prefix()));
+    }
+
+    /**
+     * The resolved connection config for a spec (null = current Orm::tenant() scope, else the
+     * default connection) — prefix(), engine(), charset(), collation(), database() … Resolved on
+     * every call, never cached.
+     *
+     * @param string|array<string, mixed>|ConnectionConfig|null $spec
+     */
+    public static function config(string|array|ConnectionConfig|null $spec = null): ConnectionConfig
+    {
+        return self::resolver()->spec($spec);
+    }
+
+    /** Table prefix of a connection (null = current tenant scope, else default). @param string|array<string, mixed>|ConnectionConfig|null $spec */
+    public static function prefix(string|array|ConnectionConfig|null $spec = null): string
+    {
+        return self::config($spec)->prefix();
+    }
+
+    /**
+     * Prefixed, unquoted table name for raw SQL: Orm::tableName('users') → "app_users". Prefer
+     * Orm::connection()->wrapTable('users') (quoted) when building SQL strings.
+     *
+     * @param string|array<string, mixed>|ConnectionConfig|null $spec
+     */
+    public static function tableName(string $table, string|array|ConnectionConfig|null $spec = null): string
+    {
+        return self::config($spec)->table($table);
     }
 
     /** @param string|array<string, mixed>|ConnectionConfig|null $spec */
@@ -247,14 +276,15 @@ final class Orm
         return Model\Relations\Relation::enforceMorphMap($map, $merge);
     }
 
-    public static function grammar(string $driver): Grammar
+    /** A new grammar instance (one per connection handle) compiling with $tablePrefix. */
+    public static function grammar(string $driver, string $tablePrefix = ''): Grammar
     {
         $factory = self::$grammars[$driver] ?? null;
 
-        return $factory !== null ? $factory() : match ($driver) {
+        return ($factory !== null ? $factory() : match ($driver) {
             'mysql' => new MySqlGrammar(),
             default => throw new \InvalidArgumentException("No grammar registered for driver [{$driver}] (Orm::extendGrammar()).") ,
-        };
+        })->setTablePrefix($tablePrefix);
     }
 
     /** @param Closure(): Grammar $factory */

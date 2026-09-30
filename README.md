@@ -5,7 +5,7 @@ the connection is chosen **per call**, every connection comes from a **pool** an
 and handles / models never hold one. No illuminate dependency.
 
 ```bash
-composer require loongs/orm        # once published; locally via a path repo (see "Development")
+composer require loongs/orm:dev-main   # Packagist; in the monorepo via a path repo (see "Development")
 ```
 
 ## Layout
@@ -297,6 +297,40 @@ $country->posts()->orderBy('posts.id')->paginate(20);
 
 The through table is joined (same database as the related one; qualify columns in constraints). Soft-deleted
 through rows are excluded when the through model uses `SoftDeletes`.
+
+## Table prefixes
+
+Every connection (named in `config/database.php`, ad-hoc array, URL `mysql://u:p@h/db?prefix=app_&engine=InnoDB`,
+`ConnectionConfig`) may carry `prefix` (`[A-Za-z0-9_]`, max 64), plus `engine`, `charset`, `collation`. The prefix is
+applied by the grammar, so it works the same for the default connection, the framework pool, tenant pools and
+`Orm::tenant()` scopes:
+
+```php
+$shop = ['database' => 'tenant_42', 'prefix' => 'shop_'];
+Orm::table('users', $shop)->insert(['name' => 'amy']);                         // `shop_users`
+Orm::table('users as u', $shop)->join('posts as p', 'p.user_id', '=', 'u.id')->select('u.name', 'p.*');
+// select `shop_u`.`name`, `shop_p`.* from `shop_users` as `shop_u` inner join `shop_posts` as `shop_p` on ...
+Orm::tenant($shop, function () {
+    User::query()->count();                    // models, relations, pivots, morph/through tables: `shop_...`
+    Orm::prefix();                             // 'shop_'  (current scope / default when null)
+    Orm::tableName('users');                   // 'shop_users'
+    Orm::config()->tableOptions();             // ['prefix' => 'shop_', 'engine' => ?, 'charset' => 'utf8mb4', 'collation' => ?]
+});
+$c = Orm::connection($shop);                   // raw SQL: build identifiers with the connection
+$c->select('select count(*) n from ' . $c->wrapTable('users') . ' where ' . $c->wrap('users.name') . ' = ?', ['amy']);
+```
+
+* Public API: `Orm::config($spec)` (normalised `ConnectionConfig`: `prefix()`, `table()`, `engine()`, `charset()`,
+  `collation()`, `tableOptions()`), `Orm::prefix($spec)`, `Orm::tableName($table, $spec)`,
+  `Connection::prefix()/tableName()/wrapTable()/wrap()`, `Builder::wrap()/wrapTable()`,
+  `Model::getTablePrefix()/getPrefixedTable()` (`getTable()` stays logical). All resolve per call — nothing cached.
+* Aliases are prefixed too (same as Laravel): `users as u` → `` `shop_users` as `shop_u` ``, and qualified columns
+  `u.name` → `` `shop_u`.`name` ``. Raw fragments (`whereRaw`, `selectRaw`, `DB::raw`) are **not** rewritten — build
+  their identifiers with `$query->wrap()` / `wrapTable()`. `Expression` tables are left alone.
+* The prefix is part of the connection fingerprint: same database with a different prefix = a different pool bucket
+  and a different transaction connection.
+* A model keeps its bound connection (and so its prefix) inside another tenant's scope.
+* The framework `DatabaseManager` raw API has no prefix concept; only ORM builders / models apply it.
 
 ## loongs/framework integration
 

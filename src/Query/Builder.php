@@ -70,6 +70,21 @@ class Builder
         return new static($this->connection);
     }
 
+    /**
+     * Quote a column / "table.column" for raw fragments with this connection's table prefix:
+     * selectRaw('count(' . $q->wrap('p.id') . ') as n') → count(`app_p`.`id`) as n.
+     */
+    public function wrap(string $column): string
+    {
+        return $this->connection->getGrammar()->wrap($column);
+    }
+
+    /** Quote a (prefixed) table name for raw fragments: $q->wrapTable('posts') → `app_posts`. */
+    public function wrapTable(string $table): string
+    {
+        return $this->connection->getGrammar()->wrapTable($table);
+    }
+
     public function raw(string|int|float $value): Expression
     {
         return new Expression($value);
