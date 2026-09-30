@@ -1,0 +1,174 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Loongs\Orm\Connection;
+
+use InvalidArgumentException;
+
+/**
+ * Immutable description of "which database" a query runs against.
+ *
+ * - named:  a connection from config/database.php ("mysql", "central" …). May be served by a pool.
+ * - ad-hoc: a raw config array or DSN (e.g. a tenant database). Never pooled unless the opt-in
+ *           tenant pool is enabled.
+ *
+ * $key identifies the target: "name:<name>" or "adhoc:<sha1 of the normalised config incl. credentials>".
+ * Two configs share a key only if every connection parameter is identical.
+ */
+final readonly class ConnectionConfig
+{
+    /** @param array<string, mixed> $config */
+    private function __construct(
+        public ?string $name,
+        public array $config,
+        public string $key,
+    ) {
+    }
+
+    /** @param array<string, mixed> $config */
+    public static function named(string $name, array $config): self
+    {
+        if ($name === '') {
+            throw new InvalidArgumentException('Connection name must not be empty.');
+        }
+
+        return new self($name, self::normalise($config), 'name:' . $name);
+    }
+
+    /** @param array<string, mixed> $config */
+    public static function adhoc(array $config): self
+    {
+        if (isset($config['url']) && is_string($config['url'])) {
+            $config = array_replace(self::parseUrl($config['url']), array_diff_key($config, ['url' => 1]));
+        }
+        $norm = self::normalise($config);
+        $fp = $norm;
+        ksort($fp);
+        if (isset($fp['options']) && is_array($fp['options'])) {
+            ksort($fp['options']);
+        }
+
+        return new self(null, $norm, 'adhoc:' . sha1(json_encode($fp, JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE)));
+    }
+
+    /**
+     * "mysql://user:pass@host:3306/db?charset=utf8mb4&unix_socket=/tmp/mysql.sock"
+     * or a PDO DSN "mysql:host=…;dbname=…" (credentials via $username / $password).
+     */
+    public static function fromDsn(string $dsn, ?string $username = null, ?string $password = null): self
+    {
+        if (str_contains($dsn, '://')) {
+            $cfg = self::parseUrl($dsn);
+            if ($username !== null) {
+                $cfg['username'] = $username;
+            }
+            if ($password !== null) {
+                $cfg['password'] = $password;
+            }
+            return self::adhoc($cfg);
+        }
+        if (!preg_match('/^([a-z0-9_]+):(.*)$/i', $dsn, $m)) {
+            throw new InvalidArgumentException('Unrecognised DSN (expected driver://… or driver:key=value;…).');
+        }
+        $cfg = ['driver' => strtolower($m[1]), 'dsn' => $dsn];
+        foreach (explode(';', $m[2]) as $pair) {
+            if (!str_contains($pair, '=')) {
+                continue;
+            }
+            [$k, $v] = array_map('trim', explode('=', $pair, 2));
+            match (strtolower($k)) {
+                'dbname' => $cfg['database'] = $v,
+                'host' => $cfg['host'] = $v,
+                'port' => $cfg['port'] = (int) $v,
+                'unix_socket' => $cfg['unix_socket'] = $v,
+                'charset' => $cfg['charset'] = $v,
+                default => null,
+            };
+        }
+        $cfg['username'] = $username ?? 'root';
+        $cfg['password'] = $password ?? '';
+
+        return self::adhoc($cfg);
+    }
+
+    public function isNamed(): bool
+    {
+        return $this->name !== null;
+    }
+
+    public function driver(): string
+    {
+        return (string) $this->config['driver'];
+    }
+
+    public function database(): string
+    {
+        return (string) ($this->config['database'] ?? '');
+    }
+
+    /** Safe description (never includes the password). */
+    public function describe(): string
+    {
+        $c = $this->config;
+        $where = ($c['unix_socket'] ?? '') !== '' ? 'unix:' . $c['unix_socket'] : ($c['host'] ?? '?') . ':' . ($c['port'] ?? '');
+        $target = sprintf('%s://%s@%s/%s', $c['driver'], $c['username'] ?? '', $where, $c['database'] ?? '');
+
+        return $this->name !== null ? $this->name . ' (' . $target . ')' : $target;
+    }
+
+    /** @return array<string, mixed> */
+    private static function parseUrl(string $url): array
+    {
+        $p = parse_url($url);
+        if ($p === false || !isset($p['scheme'])) {
+            throw new InvalidArgumentException('Invalid connection URL.');
+        }
+        $cfg = [
+            'driver' => strtolower($p['scheme']),
+            'host' => isset($p['host']) ? rawurldecode($p['host']) : '127.0.0.1',
+            'port' => isset($p['port']) ? (int) $p['port'] : 3306,
+            'database' => isset($p['path']) ? rawurldecode(ltrim($p['path'], '/')) : '',
+            'username' => isset($p['user']) ? rawurldecode($p['user']) : 'root',
+            'password' => isset($p['pass']) ? rawurldecode($p['pass']) : '',
+        ];
+        if (isset($p['query'])) {
+            parse_str($p['query'], $q);
+            foreach (['charset', 'unix_socket', 'collation'] as $k) {
+                if (isset($q[$k]) && is_string($q[$k])) {
+                    $cfg[$k] = $q[$k];
+                }
+            }
+        }
+
+        return $cfg;
+    }
+
+    /**
+     * @param array<string, mixed> $c
+     * @return array<string, mixed>
+     */
+    private static function normalise(array $c): array
+    {
+        $driver = strtolower((string) ($c['driver'] ?? 'mysql'));
+        $out = [
+            'driver' => $driver === 'mariadb' ? 'mysql' : $driver,
+            'host' => (string) ($c['host'] ?? '127.0.0.1'),
+            'port' => (int) ($c['port'] ?? 3306),
+            'database' => (string) ($c['database'] ?? ''),
+            'username' => (string) ($c['username'] ?? 'root'),
+            'password' => (string) ($c['password'] ?? ''),
+            'charset' => (string) ($c['charset'] ?? 'utf8mb4'),
+            'unix_socket' => trim((string) ($c['unix_socket'] ?? '')),
+            'options' => is_array($c['options'] ?? null) ? $c['options'] : [],
+        ];
+        if (isset($c['dsn']) && is_string($c['dsn']) && $c['dsn'] !== '') {
+            $out['dsn'] = $c['dsn'];
+        }
+        if (isset($c['collation']) && is_string($c['collation']) && $c['collation'] !== '') {
+            $out['collation'] = $c['collation'];
+        }
+
+        return $out;
+    }
+}

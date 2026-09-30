@@ -1,0 +1,24 @@
+{
+    "name": "loongs/orm",
+    "description": "loong-swoole ORM — Eloquent-style query builder, models and relations; connection chosen per call (SaaS / per-tenant databases), coroutine-safe",
+    "type": "library",
+    "license": "MIT",
+    "keywords": ["orm", "active-record", "query-builder", "swoole", "saas", "multi-tenant", "loongs"],
+    "require": {
+        "php": "^8.4",
+        "ext-pdo": "*",
+        "loongs/helper": "dev-main"
+    },
+    "suggest": {
+        "ext-pdo_mysql": "MySQL driver (the built-in grammar)",
+        "ext-swoole": "Coroutine-local transactions / tenant scopes and pooled named connections",
+        "loongs/framework": "Named connections use the framework's Swoole PDOPool (db()) when it is booted"
+    },
+    "autoload": {
+        "psr-4": {
+            "Loongs\\Orm\\": "src/"
+        }
+    },
+    "minimum-stability": "dev",
+    "prefer-stable": true
+}
