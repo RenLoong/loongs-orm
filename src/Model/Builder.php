@@ -487,6 +487,14 @@ class Builder
         return $this;
     }
 
+    /** @param array<string, Closure|null> $eagerLoad */
+    public function setEagerLoads(array $eagerLoad): static
+    {
+        $this->eagerLoad = $eagerLoad;
+
+        return $this;
+    }
+
     /** @return array<string, Closure|null> */
     public function getEagerLoads(): array
     {

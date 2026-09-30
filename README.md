@@ -25,8 +25,9 @@ src/
     PdoFactory.php QueryExecuted.php TransactionState.php
   Query/  Builder.php JoinClause.php Expression.php Grammar/{Grammar,MySqlGrammar}.php
   Model/  Model.php Builder.php Collection.php Pivot.php Attribute.php Scope.php SoftDeletes.php SoftDeletingScope.php
-          Concerns/{HasAttributes,HasRelationships,HasTimestamps,HasGlobalScopes,HidesAttributes}.php
-          Relations/{Relation,HasOneOrMany,HasOne,HasMany,BelongsTo,BelongsToMany}.php
+          Concerns/{HasAttributes,HasRelationships,HasTimestamps,HasGlobalScopes,HidesAttributes,HasEvents}.php
+          Relations/{Relation (+ morph map),HasOneOrMany,HasOne,HasMany,BelongsTo,BelongsToMany,
+                     MorphTo,MorphOneOrMany,MorphOne,MorphMany,MorphToMany,HasManyThrough,HasOneThrough}.php
   Pagination/Paginator.php  Support/{Collection,Inflector}.php  Casts/CastsAttributes.php  Exceptions/*
 ```
 
@@ -67,8 +68,9 @@ whereRaw, joins, groupBy/having, orderBy/latest, limit/offset, locks, aggregates
 update/increment/delete/truncate, chunk/chunkById/cursor, paginate); models (fillable/guarded, casts incl. enums,
 json, decimal, datetime and custom `CastsAttributes`, `Attribute::make()` accessors/mutators and `getXAttribute`,
 hidden/visible/appends, dirty tracking, timestamps, soft deletes, global and local scopes, firstOrCreate/
-updateOrCreate, events-free lifecycle); relations (hasOne, hasMany, belongsTo, belongsToMany with pivot
-columns/timestamps, attach/detach/sync) with eager loading (`with('posts.user', 'roles')`, constrained closures,
+updateOrCreate, replicate, model events + observers); relations (hasOne, hasMany, belongsTo, belongsToMany with pivot
+columns/timestamps, attach/detach/sync; morphTo/morphOne/morphMany/morphToMany/morphedByMany with a morph map;
+hasManyThrough/hasOneThrough) with eager loading (`with('posts.user', 'roles')`, constrained closures,
 `load`/`loadMissing`); transactions with savepoints and deadlock retry; query listeners (`Orm::listen`).
 Grammar: MySQL (register others with `Orm::extendGrammar()`).
 
@@ -212,6 +214,90 @@ query to another tenant; parallel transactions; LRU / idle / ttl eviction; `USE`
 connections discarded; manual / double / forgotten release; exceptions in user code, SQL and transactions; pool
 exhaustion (timeout error, no deadlock); framework default pool fallback, `discard()`, kill and exhaustion.
 
+## Model events
+
+Eloquent names, order and cancellation. Listeners are **class metadata**: register them once in `booted()`
+(never per request). They receive the model, which carries its own connection, so whatever a listener does
+through `$model` (relations, `$model->newQuery()`, `$model->getConnection()`) runs on that model's tenant, inside
+its transaction if one is open.
+
+```php
+final class Order extends Model
+{
+    protected static function booted(): void
+    {
+        static::creating(fn (Order $o) => $o->total >= 0);            // false → INSERT cancelled, save() returns false
+        static::created(fn (Order $o) => $o->audits()->create(['event' => 'created']));   // same tenant as $o
+        static::observe(OrderObserver::class);                        // methods named like events: saved(), deleted(), …
+    }
+}
+
+$order->saveQuietly();                                   // also updateQuietly / deleteQuietly / restoreQuietly / forceDeleteQuietly
+Order::withoutEvents(fn () => Order::on($t)->create([...]));     // ALL models, THIS coroutine only
+$copy = $order->replicate();                             // unsaved copy, same tenant; fires "replicating"
+```
+
+| operation | events (… = cancellable) |
+|---|---|
+| hydrate (get/find/first/cursor, relations) | `retrieved` |
+| insert | `saving`… `creating`… `created` `saved` |
+| update (dirty) / clean save | `saving`… `updating`… `updated` `saved` / `saving`… `saved` |
+| model `increment()`/`decrement()` | `updating`… `updated` |
+| `delete()` (soft or hard) | `deleting`… `deleted` |
+| `restore()` | `restoring`… then the save events, `restored` |
+| `forceDelete()` | `forceDeleting`… `deleting`… `deleted` `forceDeleted` |
+| `replicate()` | `replicating` (on the copy) |
+
+* `withoutEvents()` is stored in the coroutine `Context`: concurrent coroutines keep their events; coroutines
+  started inside (including `Orm::go()`) are **not** affected. Restored on exceptions.
+* **Mass query `update()` / `delete()` / `increment()` on a builder fire no events** (as Eloquent). Load and save
+  models when events matter. `Model::destroy()` loads the models, so it does fire them.
+* Observers are instantiated once per worker and shared by every tenant / coroutine: keep them stateless.
+* `save()` binds the instance to the connection it resolved to *before* the first listener runs (so listeners and
+  the write agree even if a listener switches `Orm::tenant()` or cancels).
+
+## Polymorphic relations
+
+```php
+Orm::morphMap(['post' => Post::class, 'video' => Video::class]);   // = Relation::morphMap(); Orm::enforceMorphMap([...]) requires it
+
+class Comment extends Model { public function commentable(): MorphTo { return $this->morphTo(); } }   // commentable_type / _id
+class Post extends Model {
+    public function comments(): MorphMany { return $this->morphMany(Comment::class, 'commentable'); }
+    public function image(): MorphOne { return $this->morphOne(Image::class, 'imageable'); }
+    public function tags(): MorphToMany { return $this->morphToMany(Tag::class, 'taggable')->withPivot('weight'); } // taggables(tag_id, taggable_type, taggable_id)
+}
+class Tag extends Model { public function posts(): MorphToMany { return $this->morphedByMany(Post::class, 'taggable'); } }
+
+Comment::on($t)->with('commentable')->get();             // 1 query + 1 per distinct type
+Comment::on($t)->with(['commentable' => fn (MorphTo $q) => $q->morphWith([Post::class => ['user']])
+    ->constrain([Video::class => fn ($q) => $q->where('public', 1)])])->get();
+$comment->commentable()->associate($video)->save();     // sets commentable_type = 'video', commentable_id
+$post->comments()->create(['body' => 'hi']);           // type + id filled
+$post->tags()->sync([1, 2 => ['weight' => 5]]);        // attach / detach / sync / updateExistingPivot, type-scoped
+```
+
+* Lookups run on the parent's connection (its tenant) unless the target class declares `$connection`.
+* The stored type is the morph-map alias, else the class name. With `enforceMorphMap()` an unmapped model throws
+  `ClassMorphViolationException` on write and an unmapped type value throws on read. A `*_type` value that is not a
+  `Model` subclass is never instantiated (`InvalidArgumentException`).
+* Builder calls in a `with(['commentable' => fn ($q) => …])` closure are replayed on every type's query.
+
+## Has-many-through
+
+```php
+// countries → users (users.country_id) → posts (posts.user_id)
+public function posts(): HasManyThrough { return $this->hasManyThrough(Post::class, User::class); }
+// all keys: firstKey (through.fk), secondKey (related.fk), localKey (this), secondLocalKey (through)
+public function owner(): HasOneThrough { return $this->hasOneThrough(Owner::class, Car::class, 'mechanic_id', 'car_id', 'id', 'id'); }
+
+Country::on($t)->with(['posts' => fn ($q) => $q->where('posts.published', 1)])->get();   // 2 queries
+$country->posts()->orderBy('posts.id')->paginate(20);
+```
+
+The through table is joined (same database as the related one; qualify columns in constraints). Soft-deleted
+through rows are excluded when the through model uses `SoftDeletes`.
+
 ## loongs/framework integration
 
 Nothing to register. When `loongs/framework` is present and its `DatabaseManager` pools are booted (worker start),
@@ -228,7 +314,7 @@ framework pools. Named configs come from `config('database')`. The framework doe
   the server / process manager forks.
 * Session state other than the current database (user variables, `SET SESSION ...`, temporary tables) survives in a
   pooled connection; reset what you change, or `discard()` the connection.
-* No model events/observers, polymorphic or has-many-through relations yet.
+* Model events are not fired by mass query updates / deletes (see "Model events").
 * `getOriginal()` applies casts and accessors; use `getRawOriginal()` for stored values.
 * MySQL normalises JSON key order; compare decoded arrays with `==`.
 

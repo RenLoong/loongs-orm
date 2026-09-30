@@ -9,7 +9,13 @@ use Loongs\Orm\Model\Model;
 use Loongs\Orm\Model\Relations\BelongsTo;
 use Loongs\Orm\Model\Relations\BelongsToMany;
 use Loongs\Orm\Model\Relations\HasMany;
+use Loongs\Orm\Model\Relations\HasManyThrough;
 use Loongs\Orm\Model\Relations\HasOne;
+use Loongs\Orm\Model\Relations\HasOneThrough;
+use Loongs\Orm\Model\Relations\MorphMany;
+use Loongs\Orm\Model\Relations\MorphOne;
+use Loongs\Orm\Model\Relations\MorphTo;
+use Loongs\Orm\Model\Relations\MorphToMany;
 use Loongs\Orm\Model\Relations\Relation;
 use Loongs\Orm\Support\Inflector;
 use ReflectionMethod;
@@ -74,6 +80,141 @@ trait HasRelationships
             $parentKey ?? $this->getKeyName(),
             $relatedKey ?? $instance->getKeyName(),
             $relation,
+        );
+    }
+
+    /**
+     * Inverse polymorphic: {name}_type + {name}_id on this model. $name defaults to the calling
+     * method's name (commentable() → commentable_type / commentable_id).
+     */
+    public function morphTo(?string $name = null, ?string $type = null, ?string $id = null, ?string $ownerKey = null): MorphTo
+    {
+        $name ??= debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 2)[1]['function'] ?? 'morphable';
+        $type ??= Inflector::snake($name) . '_type';
+        $id ??= Inflector::snake($name) . '_id';
+        $class = $this->getAttribute($type);
+        if ($class === null || $class === '') {
+            // eager loading (built on an empty instance) or no target: placeholder, no query of its own
+            $query = $this->newQueryWithoutScopes()->setEagerLoads([]);
+
+            return new MorphTo($query, $this, $id, $ownerKey, $type, $name, true);
+        }
+        $instance = $this->newRelatedInstance(Relation::resolveMorphType((string) $class));
+
+        return new MorphTo($instance->newQuery(), $this, $id, $ownerKey, $type, $name, false);
+    }
+
+    /**
+     * Polymorphic one-to-one: related table has {name}_type / {name}_id.
+     *
+     * @param class-string<Model> $related
+     */
+    public function morphOne(string $related, string $name, ?string $type = null, ?string $id = null, ?string $localKey = null): MorphOne
+    {
+        $instance = $this->newRelatedInstance($related);
+        $table = $instance->getTable();
+
+        return new MorphOne($instance->newQuery(), $this, $table . '.' . ($type ?? $name . '_type'), $this->getMorphClass(), $table . '.' . ($id ?? $name . '_id'), $localKey ?? $this->getKeyName());
+    }
+
+    /**
+     * Polymorphic one-to-many: $post->comments via comments.commentable_type / commentable_id.
+     *
+     * @param class-string<Model> $related
+     */
+    public function morphMany(string $related, string $name, ?string $type = null, ?string $id = null, ?string $localKey = null): MorphMany
+    {
+        $instance = $this->newRelatedInstance($related);
+        $table = $instance->getTable();
+
+        return new MorphMany($instance->newQuery(), $this, $table . '.' . ($type ?? $name . '_type'), $this->getMorphClass(), $table . '.' . ($id ?? $name . '_id'), $localKey ?? $this->getKeyName());
+    }
+
+    /**
+     * Polymorphic many-to-many from the typed side: $post->tags() via taggables
+     * (tag_id, taggable_id, taggable_type). Defaults: table = plural($name), foreign pivot key
+     * {name}_id, related pivot key tag_id.
+     *
+     * @param class-string<Model> $related
+     */
+    public function morphToMany(
+        string $related,
+        string $name,
+        ?string $table = null,
+        ?string $foreignPivotKey = null,
+        ?string $relatedPivotKey = null,
+        ?string $parentKey = null,
+        ?string $relatedKey = null,
+        ?string $relation = null,
+    ): MorphToMany {
+        $relation ??= debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 2)[1]['function'] ?? 'related';
+        $instance = $this->newRelatedInstance($related);
+
+        return new MorphToMany(
+            $instance->newQuery(), $this, $name . '_type', $this->getMorphClass(), $table ?? Inflector::plural($name),
+            $foreignPivotKey ?? $name . '_id', $relatedPivotKey ?? $instance->getForeignKey(),
+            $parentKey ?? $this->getKeyName(), $relatedKey ?? $instance->getKeyName(), $relation, false,
+        );
+    }
+
+    /**
+     * Inverse of morphToMany: $tag->posts() — pivot rows whose {name}_type is Post's morph class.
+     *
+     * @param class-string<Model> $related
+     */
+    public function morphedByMany(
+        string $related,
+        string $name,
+        ?string $table = null,
+        ?string $foreignPivotKey = null,
+        ?string $relatedPivotKey = null,
+        ?string $parentKey = null,
+        ?string $relatedKey = null,
+        ?string $relation = null,
+    ): MorphToMany {
+        $relation ??= debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 2)[1]['function'] ?? 'related';
+        $instance = $this->newRelatedInstance($related);
+
+        return new MorphToMany(
+            $instance->newQuery(), $this, $name . '_type', $instance->getMorphClass(), $table ?? Inflector::plural($name),
+            $foreignPivotKey ?? $this->getForeignKey(), $relatedPivotKey ?? $name . '_id',
+            $parentKey ?? $this->getKeyName(), $relatedKey ?? $instance->getKeyName(), $relation, true,
+        );
+    }
+
+    /**
+     * Far relation through an intermediate model: Country::posts() through User.
+     * Keys: $firstKey on the through table (users.country_id), $secondKey on the related table
+     * (posts.user_id), $localKey on this model (countries.id), $secondLocalKey on the through model (users.id).
+     *
+     * @param class-string<Model> $related
+     * @param class-string<Model> $through
+     */
+    public function hasManyThrough(string $related, string $through, ?string $firstKey = null, ?string $secondKey = null, ?string $localKey = null, ?string $secondLocalKey = null): HasManyThrough
+    {
+        $throughInstance = $this->newRelatedInstance($through);
+        $instance = $this->newRelatedInstance($related);
+
+        return new HasManyThrough(
+            $instance->newQuery(), $this, $throughInstance,
+            $firstKey ?? $this->getForeignKey(), $secondKey ?? $throughInstance->getForeignKey(),
+            $localKey ?? $this->getKeyName(), $secondLocalKey ?? $throughInstance->getKeyName(),
+        );
+    }
+
+    /**
+     * @param class-string<Model> $related
+     * @param class-string<Model> $through
+     */
+    public function hasOneThrough(string $related, string $through, ?string $firstKey = null, ?string $secondKey = null, ?string $localKey = null, ?string $secondLocalKey = null): HasOneThrough
+    {
+        $throughInstance = $this->newRelatedInstance($through);
+        $instance = $this->newRelatedInstance($related);
+
+        return new HasOneThrough(
+            $instance->newQuery(), $this, $throughInstance,
+            $firstKey ?? $this->getForeignKey(), $secondKey ?? $throughInstance->getForeignKey(),
+            $localKey ?? $this->getKeyName(), $secondLocalKey ?? $throughInstance->getKeyName(),
         );
     }
 

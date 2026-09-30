@@ -9,6 +9,7 @@ use JsonSerializable;
 use Loongs\Orm\Connection\Connection;
 use Loongs\Orm\Connection\ConnectionConfig;
 use Loongs\Orm\Exceptions\MassAssignmentException;
+use Loongs\Orm\Model\Relations\Relation;
 use Loongs\Orm\Orm;
 use Loongs\Orm\Query\Builder as QueryBuilder;
 use Loongs\Orm\Support\Inflector;
@@ -39,6 +40,7 @@ abstract class Model implements ArrayAccess, JsonSerializable, Stringable
     use Concerns\HasRelationships;
     use Concerns\HasTimestamps;
     use Concerns\HasGlobalScopes;
+    use Concerns\HasEvents;
 
     public const ?string CREATED_AT = 'created_at';
 
@@ -105,7 +107,7 @@ abstract class Model implements ArrayAccess, JsonSerializable, Stringable
         }
     }
 
-    /** Register global scopes here. */
+    /** Register global scopes and model event listeners here (static::creating(fn …), static::observe(…)). */
     protected static function booted(): void
     {
     }
@@ -203,6 +205,7 @@ abstract class Model implements ArrayAccess, JsonSerializable, Stringable
         $model = $this->newInstance([], true);
         $model->setRawAttributes($row, true);
         $model->boundConnection = $connection;
+        $model->fireModelEvent('retrieved', false);
 
         return $model;
     }
@@ -231,18 +234,32 @@ abstract class Model implements ArrayAccess, JsonSerializable, Stringable
     public function save(array $options = []): bool
     {
         $query = $this->newQueryWithoutScopes()->getQuery();
+        // Pin before any listener runs: listeners (and this save) always see the database this
+        // instance resolved to, even if a listener switches Orm::tenant() or the save is cancelled.
+        $this->boundConnection ??= $query->getConnection()->config;
+        if (!$this->fireModelEvent('saving')) {
+            return false;
+        }
         $saved = $this->exists ? ($this->isDirty() ? $this->performUpdate($query) : true) : $this->performInsert($query);
         if ($saved) {
-            // Pin: from now on this instance always writes to where it was saved.
-            $this->boundConnection ??= $query->getConnection()->config;
+            $this->fireModelEvent('saved', false);
             $this->syncOriginal();
         }
 
         return $saved;
     }
 
+    /** save() without firing any model event (this coroutine, for the duration of the call). @param array<string, mixed> $options */
+    public function saveQuietly(array $options = []): bool
+    {
+        return static::withoutEvents(fn (): bool => $this->save($options));
+    }
+
     protected function performInsert(QueryBuilder $query): bool
     {
+        if (!$this->fireModelEvent('creating')) {
+            return false;
+        }
         if ($this->usesTimestamps()) {
             $this->updateTimestamps();
         }
@@ -256,12 +273,16 @@ abstract class Model implements ArrayAccess, JsonSerializable, Stringable
         $this->exists = true;
         $this->wasRecentlyCreated = true;
         $this->changes = [];
+        $this->fireModelEvent('created', false);
 
         return true;
     }
 
     protected function performUpdate(QueryBuilder $query): bool
     {
+        if (!$this->fireModelEvent('updating')) {
+            return false;
+        }
         if ($this->usesTimestamps()) {
             $this->updateTimestamps();
         }
@@ -269,6 +290,7 @@ abstract class Model implements ArrayAccess, JsonSerializable, Stringable
         if ($dirty !== []) {
             $this->setKeysForSaveQuery($query)->update($dirty);
             $this->syncChanges();
+            $this->fireModelEvent('updated', false);
         }
 
         return true;
@@ -289,15 +311,30 @@ abstract class Model implements ArrayAccess, JsonSerializable, Stringable
         return $this->fill($attributes)->save();
     }
 
+    /** @param array<string, mixed> $attributes */
+    public function updateQuietly(array $attributes = []): bool
+    {
+        return static::withoutEvents(fn (): bool => $this->update($attributes));
+    }
+
     public function delete(): bool
     {
         if (!$this->exists) {
             return false;
         }
+        if (!$this->fireModelEvent('deleting')) {
+            return false;
+        }
         $this->performDeleteOnModel();
         $this->afterDelete();
+        $this->fireModelEvent('deleted', false);
 
         return true;
+    }
+
+    public function deleteQuietly(): bool
+    {
+        return static::withoutEvents(fn (): bool => $this->delete());
     }
 
     protected function performDeleteOnModel(): void
@@ -329,6 +366,9 @@ abstract class Model implements ArrayAccess, JsonSerializable, Stringable
         if (!$this->exists) {
             return $query->increment($column, $amount, $extra);
         }
+        if (!$this->fireModelEvent('updating')) {
+            return 0;
+        }
         if ($this->usesTimestamps() && static::UPDATED_AT !== null && !isset($extra[static::UPDATED_AT])) {
             $extra[static::UPDATED_AT] = $this->freshTimestampString();
         }
@@ -337,6 +377,8 @@ abstract class Model implements ArrayAccess, JsonSerializable, Stringable
         foreach ($extra as $k => $v) {
             $this->setAttribute($k, $v);
         }
+        $this->syncChanges();
+        $this->fireModelEvent('updated', false);
         $this->syncOriginalAttributes(array_merge([$column], array_keys($extra)));
 
         return $n;
@@ -368,6 +410,21 @@ abstract class Model implements ArrayAccess, JsonSerializable, Stringable
         }
 
         return static::on($this->getConnectionConfig())->withoutGlobalScopes()->find($this->getKey());
+    }
+
+    /**
+     * Unsaved copy (same connection / tenant) without primary key and timestamps; fires
+     * "replicating" on the copy. @param list<string>|null $except
+     */
+    public function replicate(?array $except = null): static
+    {
+        $drop = array_filter([$this->getKeyName(), static::CREATED_AT, static::UPDATED_AT, ...($except ?? [])], static fn ($c): bool => $c !== null);
+        $instance = $this->newInstance();
+        $instance->setRawAttributes(array_diff_key($this->attributes, array_flip($drop)));
+        $instance->setRelations($this->relations);
+        $instance->fireModelEvent('replicating', false);
+
+        return $instance;
     }
 
     public function is(?Model $other): bool
@@ -481,6 +538,12 @@ abstract class Model implements ArrayAccess, JsonSerializable, Stringable
     public function qualifyColumn(string $column): string
     {
         return str_contains($column, '.') ? $column : $this->getTable() . '.' . $column;
+    }
+
+    /** Value stored in *_type columns of polymorphic relations: the morph-map alias, else the class name. */
+    public function getMorphClass(): string
+    {
+        return Relation::getMorphAlias(static::class);
     }
 
     public function getPerPage(): int

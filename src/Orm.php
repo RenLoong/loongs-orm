@@ -225,6 +225,28 @@ final class Orm
         return Coroutine::create(static fn () => $tenant !== null ? self::tenant($tenant, $callback) : $callback());
     }
 
+    /**
+     * Polymorphic type map (alias stored in *_type columns => model class). Same as Relation::morphMap().
+     *
+     * @param array<string, class-string<Model\Model>>|null $map
+     * @return array<string, class-string<Model\Model>>
+     */
+    public static function morphMap(?array $map = null, bool $merge = true): array
+    {
+        return Model\Relations\Relation::morphMap($map, $merge);
+    }
+
+    /**
+     * Morph map + require an alias for every polymorphic model. Same as Relation::enforceMorphMap().
+     *
+     * @param array<string, class-string<Model\Model>> $map
+     * @return array<string, class-string<Model\Model>>
+     */
+    public static function enforceMorphMap(array $map, bool $merge = true): array
+    {
+        return Model\Relations\Relation::enforceMorphMap($map, $merge);
+    }
+
     public static function grammar(string $driver): Grammar
     {
         $factory = self::$grammars[$driver] ?? null;

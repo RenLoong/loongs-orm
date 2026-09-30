@@ -11,16 +11,21 @@ use Loongs\Orm\Model\Pivot;
 use Loongs\Orm\Query\Builder as QueryBuilder;
 use Loongs\Orm\Support\Collection as BaseCollection;
 
-final class BelongsToMany extends Relation
+class BelongsToMany extends Relation
 {
     /** @var list<string> */
-    private array $pivotColumns = [];
+    protected array $pivotColumns = [];
 
-    private ?string $pivotCreatedAt = null;
+    protected ?string $pivotCreatedAt = null;
 
-    private ?string $pivotUpdatedAt = null;
+    protected ?string $pivotUpdatedAt = null;
 
-    private bool $joined = false;
+    protected bool $joined = false;
+
+    /** morphToMany / morphedByMany: pivot {name}_type column and the value it must hold */
+    protected ?string $morphType = null;
+
+    protected ?string $morphClass = null;
 
     public function __construct(
         Builder $query,
@@ -39,15 +44,24 @@ final class BelongsToMany extends Relation
     {
         $this->performJoin();
         $this->query->where($this->table . '.' . $this->foreignPivotKey, '=', $this->parent->getAttribute($this->parentKey));
+        $this->addMorphConstraint();
     }
 
     public function addEagerConstraints(array $models): void
     {
         $this->performJoin();
         $this->query->whereIn($this->table . '.' . $this->foreignPivotKey, $this->getKeys($models, $this->parentKey));
+        $this->addMorphConstraint();
     }
 
-    private function performJoin(): void
+    protected function addMorphConstraint(): void
+    {
+        if ($this->morphType !== null) {
+            $this->query->where($this->table . '.' . $this->morphType, '=', $this->morphClass);
+        }
+    }
+
+    protected function performJoin(): void
     {
         if ($this->joined) {
             return;
@@ -128,10 +142,26 @@ final class BelongsToMany extends Relation
         return $this->parent->getAttribute($this->parentKey) === null ? $this->related->newCollection() : $this->get();
     }
 
-    /** Pivot table query on the PARENT's connection. */
+    /** Pivot rows of this relation (parent key not applied; morph type is), on the PARENT's connection. */
     public function newPivotQuery(): QueryBuilder
     {
+        $q = $this->newPivotStatement();
+        if ($this->morphType !== null) {
+            $q->where($this->morphType, '=', $this->morphClass);
+        }
+
+        return $q;
+    }
+
+    /** Bare pivot table on the PARENT's connection (inserts). */
+    public function newPivotStatement(): QueryBuilder
+    {
         return $this->parent->getConnection()->table($this->table);
+    }
+
+    public function getTable(): string
+    {
+        return $this->table;
     }
 
     /** @param array<string, mixed> $attributes */
@@ -148,7 +178,7 @@ final class BelongsToMany extends Relation
             $groups[implode(',', array_keys($row))][] = $row;
         }
         foreach ($groups as $group) {
-            $this->newPivotQuery()->insert($group);
+            $this->newPivotStatement()->insert($group);
         }
     }
 
@@ -204,9 +234,12 @@ final class BelongsToMany extends Relation
     }
 
     /** @param array<string, mixed> $attrs @return array<string, mixed> */
-    private function pivotRow(int|string $id, array $attrs): array
+    protected function pivotRow(int|string $id, array $attrs): array
     {
         $row = [$this->foreignPivotKey => $this->parent->getAttribute($this->parentKey), $this->relatedPivotKey => $id] + $attrs;
+        if ($this->morphType !== null) {
+            $row[$this->morphType] = $this->morphClass;
+        }
         $now = $this->parent->freshTimestampString();
         if ($this->pivotCreatedAt !== null) {
             $row[$this->pivotCreatedAt] ??= $now;
@@ -219,7 +252,7 @@ final class BelongsToMany extends Relation
     }
 
     /** @return array<int|string, array<string, mixed>> id => extra pivot attributes */
-    private function normaliseIds(mixed $ids): array
+    protected function normaliseIds(mixed $ids): array
     {
         if ($ids instanceof Model) {
             return [$ids->getAttribute($this->relatedKey) => []];

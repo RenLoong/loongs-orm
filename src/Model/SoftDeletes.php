@@ -29,12 +29,25 @@ trait SoftDeletes
 
     public function forceDelete(): bool
     {
+        if (!$this->exists || !$this->fireModelEvent('forceDeleting')) {
+            return false;
+        }
         $this->forceDeleting = true;
         try {
-            return $this->delete();
+            $deleted = $this->delete();
         } finally {
             $this->forceDeleting = false;
         }
+        if ($deleted) {
+            $this->fireModelEvent('forceDeleted', false);
+        }
+
+        return $deleted;
+    }
+
+    public function forceDeleteQuietly(): bool
+    {
+        return static::withoutEvents(fn (): bool => $this->forceDelete());
     }
 
     public function isForceDeleting(): bool
@@ -60,14 +73,24 @@ trait SoftDeletes
         $this->syncOriginalAttributes(array_keys($columns));
     }
 
+    /** Fires restoring (cancellable) → saving/updating/updated/saved → restored. */
     public function restore(): bool
     {
-        if (!$this->exists) {
+        if (!$this->exists || !$this->fireModelEvent('restoring')) {
             return false;
         }
         $this->setAttribute($this->getDeletedAtColumn(), null);
+        $restored = $this->save();
+        if ($restored) {
+            $this->fireModelEvent('restored', false);
+        }
 
-        return $this->save();
+        return $restored;
+    }
+
+    public function restoreQuietly(): bool
+    {
+        return static::withoutEvents(fn (): bool => $this->restore());
     }
 
     public function trashed(): bool
