@@ -220,7 +220,7 @@ trait HasRelationships
 
     /**
      * Related model instance. Unless the related class declares its own $connection (e.g. a
-     * central-database model), it runs on THIS model's connection — the tenant it was loaded from.
+     * central-database model), it runs on THIS model's connection — the database it was loaded from.
      *
      * @template T of Model
      * @param class-string<T> $class

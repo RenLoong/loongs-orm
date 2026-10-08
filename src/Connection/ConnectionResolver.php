@@ -15,16 +15,15 @@ use WeakReference;
  * Turns a connection spec into a ConnectionConfig and hands out Leases.
  *
  * Every connection comes from a pool and goes back to the same pool:
+ *  - a registered LeaseProvider that claims the config (Orm::addLeaseProvider) → its pool;
  *  - named connection + framework PDOPool booted in this worker → the framework pool;
- *  - anything else (tenant array / DSN, or a named config without a booted framework pool) → the
- *    ORM TenantPool, one bounded bucket per full config fingerprint (credentials included).
+ *  - anything else (config array / DSN, or a named config without a booted framework pool) → the
+ *    ORM ConnectionPool, one bounded bucket per full config fingerprint (credentials included).
  * Outside the pools nothing holds a PDO: handles and models keep a ConnectionConfig only; leases
  * live for one statement, one transaction, or one acquire()/using() block.
  */
 final class ConnectionResolver
 {
-    public const string TENANT_KEY = 'loongs.orm.tenant';
-
     public const string HELD_KEY = 'loongs.orm.held';
 
     /** @var array<string, mixed>|\Closure(): array<string, mixed>|null ['default' => …, 'connections' => […]] */
@@ -34,7 +33,13 @@ final class ConnectionResolver
 
     private bool $autoFramework = true;
 
-    private ?TenantPool $pool = null;
+    private ?ConnectionPool $pool = null;
+
+    /** @var (\Closure(): (string|array<string, mixed>|ConnectionConfig|null))|null */
+    private ?\Closure $defaultResolver = null;
+
+    /** @var list<LeaseProvider> */
+    private array $providers = [];
 
     private ?PoolConfig $poolConfig = null;
 
@@ -69,13 +74,49 @@ final class ConnectionResolver
     }
 
     /** The ORM pool of this process, created on first use from the resolved PoolConfig. */
-    public function pool(): TenantPool
+    public function pool(): ConnectionPool
     {
-        return $this->pool ??= new TenantPool(
+        return $this->pool ??= new ConnectionPool(
             $this->resolvePoolConfig(),
             static fn (ConnectionConfig $c): object => PdoFactory::make($c),
-            fn (object $pdo): int => $this->serialOf($pdo),
+            fn (object $pdo): int => $this->serial($pdo),
         );
+    }
+
+    /**
+     * Where a call without a connection goes (spec null): $resolver() is evaluated on EVERY such
+     * resolution and may return a spec, or null for the configured default connection. Keep it
+     * stateless / coroutine-safe (read coroutine context, never a static "current" value).
+     *
+     * @param (\Closure(): (string|array<string, mixed>|ConnectionConfig|null))|null $resolver
+     */
+    public function setDefaultResolver(?\Closure $resolver): void
+    {
+        $this->defaultResolver = $resolver;
+    }
+
+    /** @return (\Closure(): (string|array<string, mixed>|ConnectionConfig|null))|null */
+    public function defaultResolver(): ?\Closure
+    {
+        return $this->defaultResolver;
+    }
+
+    public function addLeaseProvider(LeaseProvider $provider): void
+    {
+        if (!in_array($provider, $this->providers, true)) {
+            $this->providers[] = $provider;
+        }
+    }
+
+    public function removeLeaseProvider(LeaseProvider $provider): void
+    {
+        $this->providers = array_values(array_filter($this->providers, static fn (LeaseProvider $p): bool => $p !== $provider));
+    }
+
+    /** @return list<LeaseProvider> */
+    public function leaseProviders(): array
+    {
+        return $this->providers;
     }
 
     public function resolvePoolConfig(): PoolConfig
@@ -83,13 +124,13 @@ final class ConnectionResolver
         if ($this->poolConfig !== null) {
             return $this->poolConfig;
         }
-        $fromConfig = $this->databaseConfig()['tenant_pool'] ?? [];
+        $fromConfig = $this->databaseConfig()['orm_pool'] ?? [];
 
         return PoolConfig::fromArray(array_replace(PoolConfig::envOverrides(), is_array($fromConfig) ? $fromConfig : []));
     }
 
     /**
-     * Normalise a spec. null → current tenant scope (coroutine context) → default named connection.
+     * Normalise a spec. null → the default resolver (setDefaultResolver), else the default named connection.
      *
      * @param string|array<string, mixed>|ConnectionConfig|null $spec
      */
@@ -99,11 +140,11 @@ final class ConnectionResolver
             return $spec;
         }
         if ($spec === null) {
-            $tenant = Context::get(self::TENANT_KEY);
-            if ($tenant instanceof ConnectionConfig) {
-                return $tenant;
+            $resolved = $this->defaultResolver !== null ? ($this->defaultResolver)() : null;
+            if ($resolved instanceof ConnectionConfig) {
+                return $resolved;
             }
-            $spec = $this->defaultName();
+            $spec = $resolved ?? $this->defaultName();
         }
         if (is_array($spec)) {
             return ConnectionConfig::adhoc($spec);
@@ -129,12 +170,18 @@ final class ConnectionResolver
     /** Check a connection out of the right pool (one statement, one transaction or one acquire()). */
     public function lease(ConnectionConfig $c): Lease
     {
+        foreach ($this->providers as $provider) {
+            $lease = $provider->lease($c);
+            if ($lease !== null) {
+                return $lease;
+            }
+        }
         $pools = $this->poolProvider();
         if ($c->name !== null && $pools !== null && $pools->has($c->name)) {
             $name = $c->name;
             $pdo = $pools->get($name);
 
-            return new Lease($pdo, $c, LeaseSource::Framework, $this->serialOf($pdo), static function (object $pdo, bool $reusable) use ($pools, $name): void {
+            return new Lease($pdo, $c, LeaseSource::Framework, $this->serial($pdo), static function (object $pdo, bool $reusable) use ($pools, $name): void {
                 $reusable ? $pools->put($name, $pdo) : $pools->discard($name, $pdo);
             });
         }
@@ -208,7 +255,8 @@ final class ConnectionResolver
         });
     }
 
-    private function serialOf(object $pdo): int
+    /** Diagnostic identity of a PDO object (stable while it lives; weakly held). */
+    public function serial(object $pdo): int
     {
         return $this->serials[$pdo] ??= ++$this->nextSerial;
     }
@@ -225,8 +273,8 @@ final class ConnectionResolver
         return null;
     }
 
-    /** @return array<string, mixed> read on every call (not cached) */
-    private function databaseConfig(): array
+    /** The database config (Orm::configure(), else config('database')). @return array<string, mixed> read on every call (not cached) */
+    public function databaseConfig(): array
     {
         $db = $this->database;
         if ($db instanceof \Closure) {

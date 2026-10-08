@@ -11,7 +11,8 @@ use InvalidArgumentException;
  *
  * - named:  a connection from config/database.php ("mysql", "central" …). Framework PDOPool when
  *           booted, else the ORM pool.
- * - ad-hoc: a raw config array or DSN (e.g. a tenant database). ORM pool, bucket per fingerprint().
+ * - ad-hoc: a raw config array or DSN (e.g. one database per customer). ORM pool (or a registered
+ *           LeaseProvider), bucket per fingerprint().
  *
  * $key identifies the target: "name:<name>" or "adhoc:<sha1 of the normalised config incl. credentials>".
  * Two configs share a key only if every connection parameter is identical.

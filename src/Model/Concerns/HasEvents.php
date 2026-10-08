@@ -18,9 +18,9 @@ use Loongs\Orm\Context;
  * no SQL is sent. Later listeners of that event are not called.
  *
  * Listeners are class metadata (per concrete class, static, registered once in booted()), never
- * tenant state: they receive the model instance, which carries its own connection, so anything a
+ * connection state: they receive the model instance, which carries its own connection, so anything a
  * listener does through $model (relations, $model->newQuery(), $model->getConnection()) runs on
- * the same tenant database.
+ * the same database.
  *
  * Mass updates / deletes on a query (User::on($t)->where(…)->update([…]) / ->delete()) do NOT
  * fire events — same as Eloquent. Load the models and save/delete them one by one when you need events.
@@ -138,7 +138,7 @@ trait HasEvents
 
     /**
      * Register an observer: every public method named like an event (creating(), saved(), …)
-     * becomes a listener. A class name is instantiated once; observers are shared by all tenants
+     * becomes a listener. A class name is instantiated once; observers are shared by all connections
      * and coroutines of the worker, so keep them stateless.
      *
      * @param object|class-string|list<object|class-string> $observers

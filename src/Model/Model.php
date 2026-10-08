@@ -22,7 +22,8 @@ use Stringable;
  *   1. the connection this instance is bound to (on() / setConnection() / the connection it was
  *      loaded from or first saved to),
  *   2. the class's declared $connection (name, config array or DSN),
- *   3. the current Orm::tenant() scope of this coroutine,
+ *   3. the default resolver (Orm::resolveDefaultUsing(), e.g. a coroutine-scoped connection
+ *      installed by another package), when it returns a spec,
  *   4. the default named connection.
  *
  * @method static Builder where(mixed ...$args)
@@ -54,7 +55,7 @@ abstract class Model implements ArrayAccess, JsonSerializable, Stringable
 
     public bool $incrementing = true;
 
-    /** Class default connection: name from config/database.php, config array or DSN. null → tenant scope / default. */
+    /** Class default connection: name from config/database.php, config array or DSN. null → default resolver / default connection. */
     protected string|array|null $connection = null;
 
     /** @var list<string> */
@@ -235,7 +236,7 @@ abstract class Model implements ArrayAccess, JsonSerializable, Stringable
     {
         $query = $this->newQueryWithoutScopes()->getQuery();
         // Pin before any listener runs: listeners (and this save) always see the database this
-        // instance resolved to, even if a listener switches Orm::tenant() or the save is cancelled.
+        // instance resolved to, even if a listener changes the default connection or the save is cancelled.
         $this->boundConnection ??= $query->getConnection()->config;
         if (!$this->fireModelEvent('saving')) {
             return false;
@@ -413,7 +414,7 @@ abstract class Model implements ArrayAccess, JsonSerializable, Stringable
     }
 
     /**
-     * Unsaved copy (same connection / tenant) without primary key and timestamps; fires
+     * Unsaved copy (same connection) without primary key and timestamps; fires
      * "replicating" on the copy. @param list<string>|null $except
      */
     public function replicate(?array $except = null): static
@@ -535,7 +536,7 @@ abstract class Model implements ArrayAccess, JsonSerializable, Stringable
         return Inflector::snake(Inflector::classBasename($this)) . '_' . $this->getKeyName();
     }
 
-    /** Table prefix of the connection this model resolves to right now (bound / declared / tenant scope / default). */
+    /** Table prefix of the connection this model resolves to right now (bound / declared / default resolver / default). */
     public function getTablePrefix(): string
     {
         return $this->getConnectionConfig()->prefix();

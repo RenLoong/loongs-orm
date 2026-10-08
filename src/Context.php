@@ -7,8 +7,9 @@ namespace Loongs\Orm;
 use Swoole\Coroutine;
 
 /**
- * Execution-context-local storage for the ORM (open transactions, tenant scope,
- * "no constraints" flag while building eager relations).
+ * Execution-context-local storage (open transactions, held leases, "no constraints" flag while
+ * building eager relations, model-event switches). Generic: other packages may keep their own keys
+ * here too (use your own key prefix, e.g. "vendor.package.").
  *
  * Inside a Swoole coroutine the values live in Coroutine::getContext(): they are
  * private to that coroutine, invisible to every other coroutine (child coroutines
@@ -90,14 +91,14 @@ final class Context
         return array_key_exists($key, self::$main);
     }
 
-    /** Keys currently set in this context (diagnostics / tests). @return list<string> */
-    public static function keys(): array
+    /** Keys currently set in this context that start with $prefix (diagnostics / tests). @return list<string> */
+    public static function keys(string $prefix = 'loongs.orm.'): array
     {
         if (self::inCoroutine()) {
             $ctx = Coroutine::getContext();
-            return $ctx === null ? [] : array_values(array_filter(array_map('strval', array_keys($ctx->getArrayCopy())), static fn (string $k): bool => str_starts_with($k, 'loongs.orm.')));
+            return $ctx === null ? [] : array_values(array_filter(array_map('strval', array_keys($ctx->getArrayCopy())), static fn (string $k): bool => str_starts_with($k, $prefix)));
         }
 
-        return array_values(array_filter(array_keys(self::$main), static fn (string $k): bool => str_starts_with($k, 'loongs.orm.')));
+        return array_values(array_filter(array_map('strval', array_keys(self::$main)), static fn (string $k): bool => str_starts_with($k, $prefix)));
     }
 }

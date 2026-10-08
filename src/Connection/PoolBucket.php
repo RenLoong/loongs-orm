@@ -6,7 +6,7 @@ namespace Loongs\Orm\Connection;
 
 use Swoole\Coroutine\Channel;
 
-/** @internal per-config state of TenantPool */
+/** @internal per-config state of ConnectionPool */
 final class PoolBucket
 {
     /** @var list<array{pdo: object, serial: int, born: float, at: float}> */

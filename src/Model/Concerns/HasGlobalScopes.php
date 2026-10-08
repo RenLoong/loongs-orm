@@ -7,7 +7,7 @@ namespace Loongs\Orm\Model\Concerns;
 use Closure;
 use Loongs\Orm\Model\Scope;
 
-/** Global scopes are class metadata (registered in booted()), never connection / tenant state. */
+/** Global scopes are class metadata (registered in booted()), never connection state. */
 trait HasGlobalScopes
 {
     /** @var array<class-string, array<string, Scope|Closure>> */

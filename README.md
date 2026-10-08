@@ -1,8 +1,12 @@
 # loongs/orm
 
-Eloquent-style ORM for the loong-swoole stack (PHP 8.4, Swoole coroutines), built for **SaaS multi-tenancy**:
-the connection is chosen **per call**, every connection comes from a **pool** and goes back to the **same pool**,
-and handles / models never hold one. No illuminate dependency.
+Eloquent-style ORM for the loong-swoole stack (PHP 8.4, Swoole coroutines): the connection is chosen **per call**
+(name, config array or DSN), every connection comes from a **pool** and goes back to the **same pool**, and handles /
+models never hold one. No illuminate dependency.
+
+Multi-tenancy (tenant scopes, tenant registry / resolvers, one pool per tenant) lives in
+[`loongs/saas`](https://github.com/RenLoong/loongs-saas), built on the generic extension points of this package —
+see "Upgrading: tenancy moved to loongs/saas" at the end.
 
 ```bash
 composer require loongs/orm:dev-main   # Packagist; in the monorepo via a path repo (see "Development")
@@ -12,15 +16,16 @@ composer require loongs/orm:dev-main   # Packagist; in the monorepo via a path r
 
 ```
 src/
-  Orm.php                     facade: configure, connection/table/transaction, tenant()/go(), listeners
+  Orm.php                     facade: configure, connection/table/transaction/acquire, pool, extension hooks, listeners
   Context.php                 coroutine-local storage (Coroutine::getContext(), static array outside coroutines)
   Connection/
     ConnectionConfig.php      immutable config: named / ad-hoc array / DSN; key = name:x | adhoc:sha1(full config)
-    ConnectionResolver.php    spec → config (every call); lease = framework PDOPool (named) | ORM TenantPool (everything else)
+    ConnectionResolver.php    spec → config (every call); lease = LeaseProvider(s) | framework PDOPool (named) | ORM pool
     Connection.php            query runner; plain handles hold NO PDO; pinned handles (Orm::acquire) share a HeldLease
     Lease.php LeaseSource.php one checked-out connection: release() / discard(), idempotent, safety-net reclaim
     HeldLease.php             acquire()/using() lease, ambient for its config in the acquiring coroutine
-    TenantPool.php PoolBucket.php PoolConfig.php   the ORM pool (always on): bounded per config, LRU, idle/ttl, validation
+    ConnectionPool.php PoolBucket.php PoolConfig.php   generic keyed pool (the ORM pool, always on): bounded per config, LRU, idle/ttl, validation
+    LeaseProvider.php         extension point: another package serves some configs from its own pool (loongs/saas)
     PoolProvider.php FrameworkPoolProvider.php     bridge to loongs/framework DatabaseManager (PDOPool, discard)
     PdoFactory.php QueryExecuted.php TransactionState.php
   Query/  Builder.php JoinClause.php Expression.php Grammar/{Grammar,MySqlGrammar}.php
@@ -29,6 +34,7 @@ src/
           Relations/{Relation (+ morph map),HasOneOrMany,HasOne,HasMany,BelongsTo,BelongsToMany,
                      MorphTo,MorphOneOrMany,MorphOne,MorphMany,MorphToMany,HasManyThrough,HasOneThrough}.php
   Pagination/Paginator.php  Support/{Collection,Inflector}.php  Casts/CastsAttributes.php  Exceptions/*
+tests/  orm_test.php bootstrap.php models.php   real-MySQL test suite (composer test)
 ```
 
 ## Quick start
@@ -80,17 +86,18 @@ A *connection spec* is one of:
 
 | spec | meaning |
 |---|---|
-| `null` | current tenant scope (`Orm::tenant`) if any, else the configured default |
+| `null` | the configured default (or whatever a default-connection hook returns, see "Extension points") |
 | `'central'` | named connection from `config('database.connections')` / `Orm::configure()` |
 | `['driver'=>'mysql','host'=>..,'database'=>'t42','username'=>..,'password'=>..]` | ad-hoc config array (self-contained; not merged with any named connection) |
 | `'mysql://user:pass@host:3306/db'`, `'mysql://user@unix:/tmp/mysql.sock/db'` | URL DSN |
 | `'mysql:host=...;dbname=...'` (+ `ConnectionConfig::fromDsn($dsn, $user, $pass)`) | PDO DSN |
 
 Models resolve: **bound connection** (`User::on($spec)`, `$m->setConnection($spec)`, or the connection the model was
-loaded/first saved on) → **declared** `protected ?string $connection = 'central'` → **tenant scope** → **default**.
+loaded/first saved on) → **declared** `protected ?string $connection = 'central'` → **default** (default-connection
+hook, then `default`).
 
 ```php
-User::on($tenantCfg)->where('active', true)->get();   // explicit, per query
+User::on($shopCfg)->where('active', true)->get();     // explicit, per query
 Orm::connection('mysql://root@unix:/tmp/mysql.sock/t7')->select('select 1');
 $m = new User(['name' => 'x']); $m->setConnection($cfg)->save();
 ```
@@ -99,24 +106,25 @@ $m = new User(['name' => 'x']); $m->setConnection($cfg)->save();
 
 | spec | pool |
 |---|---|
-| named connection (`'mysql'`, `'central'`, or `null` without a tenant scope → `default`) while loongs/framework pools are booted in this worker | **framework `PDOPool`** (`config/database.php` → `connections.*.pool`) |
-| tenant config: array / URL DSN / PDO DSN / `ConnectionConfig` (also via `Orm::tenant()`) | **ORM `TenantPool`**, one bucket per full config fingerprint |
-| named connection with no booted framework pool (CLI scripts, tests) | ORM `TenantPool` (bucket keyed by that config) |
+| a config claimed by a registered `LeaseProvider` (e.g. loongs/saas tenants) | **that provider's pool** |
+| named connection (`'mysql'`, `'central'`, or `null` → `default`) while loongs/framework pools are booted in this worker | **framework `PDOPool`** (`config/database.php` → `connections.*.pool`) |
+| ad-hoc config: array / URL DSN / PDO DSN / `ConnectionConfig` | **ORM pool** (`ConnectionPool`), one bucket per full config fingerprint |
+| named connection with no booted framework pool (CLI scripts, tests) | ORM pool (bucket keyed by that config) |
 
 **Guarantee.** Handles (`Orm::connection()`, `Model::on()`) and models keep a `ConnectionConfig`, never a PDO. There
-is no static per-tenant state outside the pools. A connection is checked out for one statement, one transaction, or
+is no static per-connection state outside the pools. A connection is checked out for one statement, one transaction, or
 one `acquire()`/`using()` block, and always goes back to the pool it came from; a connection can only be handed to
 a config whose fingerprint (host, port, socket, database, user, **password**, charset, options) is identical to the one
 that opened it, and `SELECT DATABASE()` is checked on every checkout from the ORM pool. Pools are per worker process.
 
 ### ORM pool settings
 
-`Orm::configurePool([...])` → `config('database.tenant_pool')` → `ORM_POOL_*` env → defaults:
+`Orm::configurePool([...])` → `config('database.orm_pool')` → `ORM_POOL_*` env → defaults:
 
 | key | env | default | meaning |
 |---|---|---|---|
-| `size` | `ORM_POOL_SIZE` | 8 | max open connections **per tenant config** (checked out + idle) |
-| `max_tenants` | `ORM_POOL_MAX_TENANTS` | 64 | tenant buckets kept; the least recently used bucket with nothing checked out is evicted |
+| `size` | `ORM_POOL_SIZE` | 8 | max open connections **per config** (checked out + idle) |
+| `max_pools` | `ORM_POOL_MAX_POOLS` | 64 | config buckets kept; the least recently used bucket with nothing checked out is evicted |
 | `idle_seconds` | `ORM_POOL_IDLE_SECONDS` | 60 | idle connections older than this are closed |
 | `ttl` | `ORM_POOL_TTL` | 600 | connections older than this are closed on return / checkout (0 = no limit) |
 | `wait_timeout` | `ORM_POOL_WAIT_TIMEOUT` | 3 | seconds a coroutine waits for a free connection, then `PoolExhaustedException` (-1 = forever) |
@@ -124,17 +132,17 @@ that opened it, and `SELECT DATABASE()` is checked on every checkout from the OR
 
 ```php
 // server/config/database.php
-'tenant_pool' => ['size' => 8, 'max_tenants' => 64, 'idle_seconds' => 60, 'ttl' => 600, 'wait_timeout' => 3],
+'orm_pool' => ['size' => 8, 'max_pools' => 64, 'idle_seconds' => 60, 'ttl' => 600, 'wait_timeout' => 3],
 
-Orm::poolStats();          // tenants, open, active, idle, waiting, created, closed, hits, discarded, waits, timeouts, evicted_tenants
-Orm::poolStats($tenant);   // open, active, idle, waiting for one tenant
+Orm::poolStats();          // pools, open, active, idle, waiting, created, closed, hits, discarded, waits, timeouts, evicted_pools
+Orm::poolStats($spec);     // open, active, idle, waiting for one config
 ```
 
-Sizing: worst case per worker ≈ `max_tenants × size` open connections (plus the framework pools) — keep it below
-MySQL `max_connections / workers`. Idle eviction is lazy (checked on checkout, at most once per second, or
-`Orm::pool()->sweep()` from a timer). When every connection of a tenant is busy, coroutines wait (hand-off, FIFO-ish)
-up to `wait_timeout`; outside a coroutine nothing can free one, so it throws immediately. `max_tenants` is soft: if
-every bucket has connections checked out, a new tenant still gets a bucket rather than failing.
+Sizing: worst case per worker ≈ `max_pools × size` open connections (plus the framework pools and any provider
+pools) — keep it below MySQL `max_connections / workers`. Idle eviction is lazy (checked on checkout, at most once per
+second, or `Orm::pool()->sweep()` from a timer). When every connection of a config is busy, coroutines wait (hand-off,
+FIFO-ish) up to `wait_timeout`; outside a coroutine nothing can free one, so it throws immediately. `max_pools` is
+soft: if every bucket has connections checked out, a new config still gets a bucket rather than failing.
 
 ## Releasing connections
 
@@ -144,15 +152,15 @@ keeps one for the transaction and returns it on commit / rollback.
 **Manual.**
 
 ```php
-$c = Orm::acquire($tenant);            // one connection until release()
+$c = Orm::acquire($spec);              // one connection until release()
 try {
     $c->table('invoices')->insert([...]);
-    User::on($tenant)->find(7);         // models / builders on the same config in this coroutine use it too
+    User::on($spec)->find(7);           // models / builders on the same config in this coroutine use it too
 } finally {
     $c->release();                      // idempotent; a second call is a no-op
 }
 
-$n = Orm::using($tenant, fn (Connection $c) => $c->table('users')->count());   // acquire + release, always
+$n = Orm::using($spec, fn (Connection $c) => $c->table('users')->count());   // acquire + release, always
 ```
 
 Nested `acquire()` of the same config in one coroutine shares the lease (reference counted; the last `release()`
@@ -175,51 +183,60 @@ Treat the warning as a bug to fix, not a feature.
 Do not keep the PDO / statements from `withLease(fn ($pdo) => ...)` past the callback, and do not pass a pinned
 handle to another coroutine.
 
-## SaaS tenants
+## Per-call connections and models
 
 ```php
-// 1. per request: resolve the tenant (e.g. from the host) then scope the whole handler
-$tenant = ['database' => 'tenant_' . $id];      // or a DSN string, or ConnectionConfig
-return Orm::tenant($tenant, function () use ($request) {
-    $user = User::where('email', $request->post('email'))->firstOrFail();   // → tenant DB
-    $user->posts()->create(['title' => 'hi']);                               // → tenant DB
-    Plan::find($user->plan_id);          // Plan declares $connection = 'central' → central DB (pooled)
-    return Orm::transaction(fn () => Invoice::create([...]));               // tenant tx, one connection
-});
-
-// 2. explicit, no scope
-User::on($tenantB)->count();
-
-// 3. background work that must keep the tenant: Orm::go() copies the current tenant into the child coroutine
-Orm::go(fn () => Audit::create([...]));   // plain go()/Coroutine::create start with NO tenant (falls back to default)
+$shop = ['driver' => 'mysql', 'host' => '10.0.0.5', 'database' => 'shop_42', 'username' => 'app', 'password' => '…'];
+$user = User::on($shop)->where('email', $email)->firstOrFail();   // → shop_42 (ORM pool bucket of that config)
+$user->posts()->create(['title' => 'hi']);                         // same connection config as $user
+Plan::find($user->plan_id);          // Plan declares $connection = 'central' → central DB (pooled)
+Orm::transaction(fn () => Invoice::on($shop)->create([...]), $shop);   // one connection for the transaction
 ```
 
-Rules of thumb:
+* A model **remembers** where it came from: loaded or first saved on config A ⇒ `save()`, `delete()`, `refresh()` and
+  relation queries go to A — the model keeps the `ConnectionConfig`, never a PDO.
+* The connection of a query builder is fixed when the builder is created.
+* Related models inherit the parent's connection unless they declare their own (`protected ?string $connection`).
+* Hot paths: `Orm::using($spec, fn () => ...)` keeps one connection for the whole block (no per-statement checkout /
+  validation round trip).
 
-* Hot request paths: `Orm::using($tenant, fn () => ...)` around the handler keeps one connection for the whole
-  request (no per-statement checkout / validation round trip).
+## Extension points
 
-* A model **remembers** where it came from: loaded or first saved on t1 ⇒ `save()`, `delete()`, `refresh()` and
-  relation queries go to t1 even if called later inside a t2 scope.
-* The connection of a query builder is fixed when the builder is created (`User::query()` inside the scope).
-* Models that live in the landlord DB should declare `protected ?string $connection = 'central';` — declared
-  connections ignore the tenant scope.
-* Related models inherit the parent's connection unless they declare their own.
-* Scopes nest; the previous tenant is restored when the callback returns or throws.
+Generic hooks, used by [`loongs/saas`](https://github.com/RenLoong/loongs-saas) for multi-tenancy; nothing in this
+package knows about tenants.
 
-Verified by `server/bin/smoke_orm.php` (not shipped), in coroutine and plain CLI mode: 200 concurrent coroutines on
-random tenants (array / URL DSN / PDO DSN specs) over pooled connections — zero cross-tenant rows, no PDO object or
-MySQL connection id on two tenants, 809 statements on 24 PDOs (size 8 × 3 tenants); pinned save after an interleaved
-query to another tenant; parallel transactions; LRU / idle / ttl eviction; `USE`-poisoned and server-killed
-connections discarded; manual / double / forgotten release; exceptions in user code, SQL and transactions; pool
-exhaustion (timeout error, no deadlock); framework default pool fallback, `discard()`, kill and exhaustion.
+```php
+// 1. default-connection hook: consulted for every `null` spec (models without bound / declared connection,
+//    Orm::table(), Orm::connection()). Return a spec, or null for the configured default. Read coroutine-local
+//    state only (Loongs\Orm\Context), never per-request statics.
+Orm::resolveDefaultUsing(fn () => Context::get('my.scope'));   // null removes the hook
+
+// 2. lease providers: serve some configs from your own pool (asked first, in registration order; null = not mine)
+final class ReportPools implements LeaseProvider
+{
+    public function __construct(private ConnectionPool $pool) {}
+    public function lease(ConnectionConfig $c): ?Lease
+    {
+        return str_starts_with($c->database(), 'report_') ? $this->pool->acquire($c) : null;
+    }
+}
+// ConnectionPool(PoolConfig, connector, serialOf (MySQL connection id, for the leak / identity checks), lease source)
+Orm::addLeaseProvider($provider = new ReportPools(new ConnectionPool(PoolConfig::fromArray(['size' => 4]),
+    fn (ConnectionConfig $c) => PdoFactory::make($c), fn (object $pdo) => Orm::resolver()->serial($pdo), LeaseSource::Provider)));
+Orm::removeLeaseProvider($provider);
+```
+
+`ConnectionPool` is the same keyed pool the ORM uses (bounded per key, LRU of keys via `max_pools`, idle / ttl,
+`SELECT DATABASE()` validation, waiting with `wait_timeout`, broken connections discarded, `has()` / `forget()` /
+`sweep()` / `stats()`); leases taken from a provider pool keep every guarantee (manual release, rollback +
+release on exceptions, discard of broken connections, safety net — see "Releasing connections").
 
 ## Model events
 
 Eloquent names, order and cancellation. Listeners are **class metadata**: register them once in `booted()`
 (never per request). They receive the model, which carries its own connection, so whatever a listener does
-through `$model` (relations, `$model->newQuery()`, `$model->getConnection()`) runs on that model's tenant, inside
-its transaction if one is open.
+through `$model` (relations, `$model->newQuery()`, `$model->getConnection()`) runs on that model's connection,
+inside its transaction if one is open.
 
 ```php
 final class Order extends Model
@@ -227,14 +244,14 @@ final class Order extends Model
     protected static function booted(): void
     {
         static::creating(fn (Order $o) => $o->total >= 0);            // false → INSERT cancelled, save() returns false
-        static::created(fn (Order $o) => $o->audits()->create(['event' => 'created']));   // same tenant as $o
+        static::created(fn (Order $o) => $o->audits()->create(['event' => 'created']));   // same connection as $o
         static::observe(OrderObserver::class);                        // methods named like events: saved(), deleted(), …
     }
 }
 
 $order->saveQuietly();                                   // also updateQuietly / deleteQuietly / restoreQuietly / forceDeleteQuietly
 Order::withoutEvents(fn () => Order::on($t)->create([...]));     // ALL models, THIS coroutine only
-$copy = $order->replicate();                             // unsaved copy, same tenant; fires "replicating"
+$copy = $order->replicate();                             // unsaved copy, same connection; fires "replicating"
 ```
 
 | operation | events (… = cancellable) |
@@ -249,12 +266,12 @@ $copy = $order->replicate();                             // unsaved copy, same t
 | `replicate()` | `replicating` (on the copy) |
 
 * `withoutEvents()` is stored in the coroutine `Context`: concurrent coroutines keep their events; coroutines
-  started inside (including `Orm::go()`) are **not** affected. Restored on exceptions.
+  started inside are **not** affected. Restored on exceptions.
 * **Mass query `update()` / `delete()` / `increment()` on a builder fire no events** (as Eloquent). Load and save
   models when events matter. `Model::destroy()` loads the models, so it does fire them.
-* Observers are instantiated once per worker and shared by every tenant / coroutine: keep them stateless.
+* Observers are instantiated once per worker and shared by every connection / coroutine: keep them stateless.
 * `save()` binds the instance to the connection it resolved to *before* the first listener runs (so listeners and
-  the write agree even if a listener switches `Orm::tenant()` or cancels).
+  the write agree even if a listener changes the default connection, e.g. a tenant scope, or cancels).
 
 ## Polymorphic relations
 
@@ -277,7 +294,7 @@ $post->comments()->create(['body' => 'hi']);           // type + id filled
 $post->tags()->sync([1, 2 => ['weight' => 5]]);        // attach / detach / sync / updateExistingPivot, type-scoped
 ```
 
-* Lookups run on the parent's connection (its tenant) unless the target class declares `$connection`.
+* Lookups run on the parent's connection unless the target class declares `$connection`.
 * The stored type is the morph-map alias, else the class name. With `enforceMorphMap()` an unmapped model throws
   `ClassMorphViolationException` on write and an unmapped type value throws on read. A `*_type` value that is not a
   `Model` subclass is never instantiated (`InvalidArgumentException`).
@@ -302,20 +319,18 @@ through rows are excluded when the through model uses `SoftDeletes`.
 
 Every connection (named in `config/database.php`, ad-hoc array, URL `mysql://u:p@h/db?prefix=app_&engine=InnoDB`,
 `ConnectionConfig`) may carry `prefix` (`[A-Za-z0-9_]`, max 64), plus `engine`, `charset`, `collation`. The prefix is
-applied by the grammar, so it works the same for the default connection, the framework pool, tenant pools and
-`Orm::tenant()` scopes:
+applied by the grammar, so it works the same for the default connection, the framework pool, the ORM pool and
+provider pools (loongs/saas tenants):
 
 ```php
-$shop = ['database' => 'tenant_42', 'prefix' => 'shop_'];
+$shop = ['database' => 'shop_42', 'prefix' => 'shop_'];
 Orm::table('users', $shop)->insert(['name' => 'amy']);                         // `shop_users`
 Orm::table('users as u', $shop)->join('posts as p', 'p.user_id', '=', 'u.id')->select('u.name', 'p.*');
 // select `shop_u`.`name`, `shop_p`.* from `shop_users` as `shop_u` inner join `shop_posts` as `shop_p` on ...
-Orm::tenant($shop, function () {
-    User::query()->count();                    // models, relations, pivots, morph/through tables: `shop_...`
-    Orm::prefix();                             // 'shop_'  (current scope / default when null)
-    Orm::tableName('users');                   // 'shop_users'
-    Orm::config()->tableOptions();             // ['prefix' => 'shop_', 'engine' => ?, 'charset' => 'utf8mb4', 'collation' => ?]
-});
+User::on($shop)->count();                      // models, relations, pivots, morph/through tables: `shop_...`
+Orm::prefix($shop);                            // 'shop_'  (default connection when null)
+Orm::tableName('users', $shop);                // 'shop_users'
+Orm::config($shop)->tableOptions();            // ['prefix' => 'shop_', 'engine' => ?, 'charset' => 'utf8mb4', 'collation' => ?]
 $c = Orm::connection($shop);                   // raw SQL: build identifiers with the connection
 $c->select('select count(*) n from ' . $c->wrapTable('users') . ' where ' . $c->wrap('users.name') . ' = ?', ['amy']);
 ```
@@ -329,16 +344,15 @@ $c->select('select count(*) n from ' . $c->wrapTable('users') . ' where ' . $c->
   their identifiers with `$query->wrap()` / `wrapTable()`. `Expression` tables are left alone.
 * The prefix is part of the connection fingerprint: same database with a different prefix = a different pool bucket
   and a different transaction connection.
-* A model keeps its bound connection (and so its prefix) inside another tenant's scope.
+* A model keeps its bound connection (and so its prefix) whatever the default connection is later.
 * The framework `DatabaseManager` raw API has no prefix concept; only ORM builders / models apply it.
 
 ## loongs/framework integration
 
 Nothing to register. When `loongs/framework` is present and its `DatabaseManager` pools are booted (worker start),
-named connections — including the default one used when no tenant is in scope — are checked out of the framework
-`PDOPool` and put back; broken ones go to `DatabaseManager::discard()` (the pool refills). Pool exhaustion
-(`pool.wait_timeout`) surfaces as `Loongs\Orm\Exceptions\PoolExhaustedException`. Tenant configs never enter the
-framework pools. Named configs come from `config('database')`. The framework does **not** depend on this package.
+named connections — including the default one — are checked out of the framework `PDOPool` and put back; broken
+ones go to `DatabaseManager::discard()` (the pool refills). Pool exhaustion (`pool.wait_timeout`) surfaces as
+`Loongs\Orm\Exceptions\PoolExhaustedException`. Ad-hoc configs never enter the framework pools. Named configs come from `config('database')`. The framework does **not** depend on this package.
 `Orm::usePools($provider)` swaps the provider (`null`: named connections use the ORM pool too).
 
 ## Caveats
@@ -357,8 +371,34 @@ framework pools. Named configs come from `config('database')`. The framework doe
 In the loong-swoole monorepo it is linked through `server/composer.dev.json` (path repo, symlink):
 
 ```bash
+cd composer/orm && composer test      # = php -d disable_functions= tests/orm_test.php cli && … co
+# needs MySQL; credentials from LOONGS_TEST_ENV=/path/to/.env (DB_*), throwaway databases loongs_orm_* are dropped at the end
 cd server && COMPOSER=composer.dev.json composer update loongs/orm
-php -d disable_functions= bin/smoke_orm.php co    # and: bin/smoke_orm.php cli
 ```
+
+## Upgrading: tenancy moved to loongs/saas (breaking)
+
+loongs/orm is now a plain ORM. Everything tenant-specific moved to `loongs/saas`
+(`composer require loongs/saas:dev-main`); there are no shims in this package.
+
+| before (loongs/orm) | now |
+|---|---|
+| `Orm::tenant($t, fn () => …)` | `Loongs\Saas\Tenancy::run($t, fn () => …)` (loongs/saas) |
+| `Orm::currentTenant()` | `Tenancy::connectionConfig()` (also `Tenancy::current()` / `id()` / `active()`) |
+| `Orm::go(fn () => …)` | `Tenancy::go(fn () => …)` |
+| `null` spec = tenant scope, else default | `null` spec = default-connection hook (`Orm::resolveDefaultUsing()`), else default; loongs/saas installs the hook |
+| `Loongs\Orm\Connection\TenantPool` | `Loongs\Orm\Connection\ConnectionPool` (generic) · per-tenant pools: `Loongs\Saas\TenantPool` |
+| tenant configs pooled in the ORM pool | tenants (inside `Tenancy`) pooled in loongs/saas `TenantPool`, one bucket per tenant; plain ad-hoc configs still in the ORM pool |
+| `PoolConfig::$maxTenants`, key `max_tenants` | `PoolConfig::$maxPools`, key `max_pools` |
+| `config('database.tenant_pool')` (ORM pool) | `config('database.orm_pool')`; `tenant_pool` is now read by loongs/saas for the tenant pools |
+| env `ORM_POOL_MAX_TENANTS` | `ORM_POOL_MAX_POOLS` (tenant pools: `TENANT_POOL_*`) |
+| `Orm::poolStats()` keys `tenants`, `evicted_tenants` | `pools`, `evicted_pools` (tenant pools: `Tenancy::poolStats()`) |
+| `ConnectionResolver::TENANT_KEY` | removed (scope key lives in loongs/saas) |
+| `LeaseSource` `Framework` / `Pool` | + `Provider` (leases from a `LeaseProvider`, e.g. tenant pools) |
+| — | new: `Orm::resolveDefaultUsing()`, `Orm::addLeaseProvider()` / `removeLeaseProvider()`, `LeaseProvider`, `ConnectionPool::has()` / `forget()`, `PoolConfig::envOverrides()`, `Context::keys($prefix)` |
+
+Defaults are unchanged (size 8, 64 buckets, idle 60 s, ttl 600 s, wait 3 s, validate), so an existing
+`'tenant_pool' => [...]` block keeps its effect on tenants once loongs/saas is installed; rename it to `orm_pool` if
+it was meant for plain ad-hoc connections.
 
 License: MIT

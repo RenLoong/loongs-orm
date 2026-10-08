@@ -11,7 +11,7 @@ use Loongs\Orm\Model\Model;
 
 /**
  * Inverse polymorphic relation: $comment->commentable is a Post, a Video, … depending on
- * commentable_type. Lookups run on the child's connection (its tenant) unless the target class
+ * commentable_type. Lookups run on the child's connection (its database) unless the target class
  * declares its own $connection.
  *
  * Eager loading (Comment::on($t)->with('commentable')) runs ONE query per distinct type. Builder

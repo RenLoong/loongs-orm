@@ -11,7 +11,9 @@ use Swoole\Coroutine\Channel;
 use Throwable;
 
 /**
- * The ORM connection pool (always on): one bounded bucket per tenant config.
+ * Keyed connection pool: one bounded bucket per connection config (always on in the ORM for config
+ * arrays / DSNs, and for named connections when no framework pool is booted). Other packages can run
+ * their own instance (e.g. behind a LeaseProvider) with their own settings and LeaseSource.
  *
  * - Keyed by ConnectionConfig::fingerprint() = the full normalised config INCLUDING credentials, so a
  *   connection is only ever handed to a config identical to the one that opened it.
@@ -22,13 +24,13 @@ use Throwable;
  *   database (a connection somebody `USE`d elsewhere, or that the server killed, is discarded).
  * - A connection returned broken / in a failed state is discarded; its slot goes to a waiter or frees up.
  * - Idle connections older than `idle_seconds`, and connections older than `ttl`, are closed (lazy
- *   sweep on checkout, at most once per second, or sweep()). At most `max_tenants` buckets: the least
+ *   sweep on checkout, at most once per second, or sweep()). At most `max_pools` buckets: the least
  *   recently used bucket with nothing checked out is evicted.
  * - Per worker process. A pool used before fork() is abandoned (not closed) in the child.
  * All bookkeeping between the yielding calls (connect, validate, Channel::pop) is non-yielding, so it
  * is atomic under Swoole's cooperative scheduling.
  */
-final class TenantPool
+final class ConnectionPool
 {
     /** @var array<string, PoolBucket> */
     private array $buckets = [];
@@ -52,16 +54,18 @@ final class TenantPool
 
     public int $timeouts = 0;
 
-    public int $evictedTenants = 0;
+    public int $evictedPools = 0;
 
     /**
-     * @param Closure(ConnectionConfig): object $connector
-     * @param Closure(object): int $serialOf
+     * @param Closure(ConnectionConfig): object $connector opens a connection (PdoFactory::make by default)
+     * @param Closure(object): int $serialOf          diagnostic identity of a PDO (ConnectionResolver::serial)
+     * @param LeaseSource $source                     reported on leases / QueryExecuted events
      */
     public function __construct(
         public readonly PoolConfig $config,
         private readonly Closure $connector,
         private readonly Closure $serialOf,
+        public readonly LeaseSource $source = LeaseSource::Pool,
     ) {
         $this->pid = getmypid() ?: 0;
     }
@@ -159,7 +163,7 @@ final class TenantPool
     }
 
     /**
-     * @return array{tenants: int, open: int, active: int, idle: int, waiting: int, created: int, closed: int, hits: int, discarded: int, waits: int, timeouts: int, evicted_tenants: int}
+     * @return array{pools: int, open: int, active: int, idle: int, waiting: int, created: int, closed: int, hits: int, discarded: int, waits: int, timeouts: int, evicted_pools: int}
      *         or, for one config: array{open: int, active: int, idle: int, waiting: int}
      */
     public function stats(?ConnectionConfig $c = null): array
@@ -177,9 +181,37 @@ final class TenantPool
             $waiting += count($b->waiters);
         }
 
-        return ['tenants' => count($this->buckets), 'open' => $open, 'active' => $active, 'idle' => $idle, 'waiting' => $waiting,
+        return ['pools' => count($this->buckets), 'open' => $open, 'active' => $active, 'idle' => $idle, 'waiting' => $waiting,
             'created' => $this->created, 'closed' => $this->closed, 'hits' => $this->hits, 'discarded' => $this->discarded,
-            'waits' => $this->waits, 'timeouts' => $this->timeouts, 'evicted_tenants' => $this->evictedTenants];
+            'waits' => $this->waits, 'timeouts' => $this->timeouts, 'evicted_pools' => $this->evictedPools];
+    }
+
+    /** True when a bucket for $c exists (open, idle or waited-for connections). */
+    public function has(ConnectionConfig $c): bool
+    {
+        return isset($this->buckets[$c->fingerprint()]);
+    }
+
+    /**
+     * Retire the bucket of one config: idle connections are closed now, checked-out ones when they
+     * come back (they are not reused). The next acquire() opens a fresh bucket. Returns whether a
+     * bucket existed.
+     */
+    public function forget(ConnectionConfig $c): bool
+    {
+        $key = $c->fingerprint();
+        $b = $this->buckets[$key] ?? null;
+        if ($b === null) {
+            return false;
+        }
+        foreach ($b->idle as $item) {
+            $this->close($b, $item);
+        }
+        $b->idle = [];
+        $b->retired = true;
+        unset($this->buckets[$key]);
+
+        return true;
     }
 
     /** Close every idle connection; checked-out ones are closed when returned. */
@@ -205,7 +237,7 @@ final class TenantPool
 
         // the release callback captures metadata only — never the PDO — so a discarded connection is
         // closed as soon as the Lease lets go of it
-        return new Lease($item['pdo'], $c, LeaseSource::Pool, $serial, function (object $pdo, bool $reusable) use ($b, $serial, $born): void {
+        return new Lease($item['pdo'], $c, $this->source, $serial, function (object $pdo, bool $reusable) use ($b, $serial, $born): void {
             $this->checkin($b, ['pdo' => $pdo, 'serial' => $serial, 'born' => $born, 'at' => 0.0], $reusable);
         });
     }
@@ -305,7 +337,7 @@ final class TenantPool
 
     private function openBucket(ConnectionConfig $c): PoolBucket
     {
-        if (count($this->buckets) >= $this->config->maxTenants) {
+        if (count($this->buckets) >= $this->config->maxPools) {
             $lru = null;
             foreach ($this->buckets as $key => $b) {
                 if ($b->active === 0 && $b->waiters === [] && ($lru === null || $b->used < $this->buckets[$lru]->used)) {
@@ -320,7 +352,7 @@ final class TenantPool
                 $victim->idle = [];
                 $victim->retired = true;
                 unset($this->buckets[$lru]);
-                $this->evictedTenants++;
+                $this->evictedPools++;
             }
             // every bucket busy: allow a temporary overflow rather than failing the request
         }

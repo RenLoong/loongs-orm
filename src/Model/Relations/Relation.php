@@ -21,7 +21,7 @@ abstract class Relation
 
     protected Model $related;
 
-    /** @var array<string, class-string<Model>> alias => model class (process-wide configuration, not tenant state) */
+    /** @var array<string, class-string<Model>> alias => model class (process-wide configuration, not connection state) */
     private static array $morphMap = [];
 
     private static bool $requireMorphMap = false;

@@ -1,9 +1,9 @@
 {
     "name": "loongs/orm",
-    "description": "loong-swoole ORM — Eloquent-style query builder, models and relations; connection chosen per call (SaaS / per-tenant databases), coroutine-safe",
+    "description": "loong-swoole ORM — Eloquent-style query builder, models and relations; connection chosen per call (name, config array, DSN), always pooled, coroutine-safe",
     "type": "library",
     "license": "MIT",
-    "keywords": ["orm", "active-record", "query-builder", "swoole", "saas", "multi-tenant", "loongs"],
+    "keywords": ["orm", "active-record", "query-builder", "connection-pool", "swoole", "loongs"],
     "require": {
         "php": "^8.4",
         "ext-pdo": "*",
@@ -11,13 +11,17 @@
     },
     "suggest": {
         "ext-pdo_mysql": "MySQL driver (the built-in grammar)",
-        "ext-swoole": "Coroutine-local transactions / tenant scopes and pooled named connections",
-        "loongs/framework": "Named connections use the framework's Swoole PDOPool (db()) when it is booted"
+        "ext-swoole": "Coroutine-local transactions / held connections and pooled named connections",
+        "loongs/framework": "Named connections use the framework's Swoole PDOPool (db()) when it is booted",
+        "loongs/saas": "Multi-tenancy on top of the ORM: tenant scopes, tenant registry / resolvers, one pool per tenant"
     },
     "autoload": {
         "psr-4": {
             "Loongs\\Orm\\": "src/"
         }
+    },
+    "scripts": {
+        "test": "php -d disable_functions= tests/orm_test.php cli && php -d disable_functions= tests/orm_test.php co"
     },
     "minimum-stability": "dev",
     "prefer-stable": true

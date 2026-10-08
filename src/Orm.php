@@ -7,26 +7,26 @@ namespace Loongs\Orm;
 use Closure;
 use Loongs\Orm\Connection\Connection;
 use Loongs\Orm\Connection\ConnectionConfig;
+use Loongs\Orm\Connection\ConnectionPool;
 use Loongs\Orm\Connection\ConnectionResolver;
+use Loongs\Orm\Connection\LeaseProvider;
 use Loongs\Orm\Connection\PoolConfig;
 use Loongs\Orm\Connection\PoolProvider;
 use Loongs\Orm\Connection\QueryExecuted;
-use Loongs\Orm\Connection\TenantPool;
 use Loongs\Orm\Exceptions\QueryException;
 use Loongs\Orm\Query\Builder;
 use Loongs\Orm\Query\Expression;
 use Loongs\Orm\Query\Grammar\Grammar;
 use Loongs\Orm\Query\Grammar\MySqlGrammar;
-use Swoole\Coroutine;
 
 /**
  * Entry point.
  *
  * Process-wide state kept here is configuration only (named connection configs, grammar
- * factories, query listeners, pool settings). No tenant or PDO is remembered outside the pools:
- * Orm::connection() returns a new lightweight handle on every call and each statement checks a
- * connection out of its pool (framework PDOPool for named connections, the ORM TenantPool for
- * tenant configs) and returns it.
+ * factories, query listeners, pool settings, extension hooks). No PDO is remembered outside the
+ * pools: Orm::connection() returns a new lightweight handle on every call and each statement checks
+ * a connection out of its pool (framework PDOPool for named connections, the ORM ConnectionPool for
+ * config arrays / DSNs, or a registered LeaseProvider) and returns it.
  */
 final class Orm
 {
@@ -70,13 +70,13 @@ final class Orm
     }
 
     /**
-     * ORM pool settings (tenant configs; named configs when no framework pool is booted). Accepts a
-     * PoolConfig or ['size' => 8, 'max_tenants' => 64, 'idle_seconds' => 60, 'ttl' => 600,
-     * 'wait_timeout' => 3, 'validate' => true]. Without it: config('database.tenant_pool') → ORM_POOL_* env → defaults.
+     * ORM pool settings (config arrays / DSNs; named configs when no framework pool is booted).
+     * Accepts a PoolConfig or ['size' => 8, 'max_pools' => 64, 'idle_seconds' => 60, 'ttl' => 600,
+     * 'wait_timeout' => 3, 'validate' => true]. Without it: config('database.orm_pool') → ORM_POOL_* env → defaults.
      *
      * @param PoolConfig|array<string, mixed> $config
      */
-    public static function configurePool(PoolConfig|array $config): TenantPool
+    public static function configurePool(PoolConfig|array $config): ConnectionPool
     {
         self::resolver()->configurePool(is_array($config) ? PoolConfig::fromArray($config) : $config);
 
@@ -84,13 +84,38 @@ final class Orm
     }
 
     /** The ORM pool of this worker process. */
-    public static function pool(): TenantPool
+    public static function pool(): ConnectionPool
     {
         return self::resolver()->pool();
     }
 
     /**
-     * Pool counters: totals, or open/active/idle/waiting for one spec.
+     * Where calls without a connection go (Model without bound / declared connection,
+     * Orm::connection(null), Orm::table($t)): $resolver() is evaluated on every such call and returns
+     * a spec, or null for the configured default connection. null removes the hook. Extension point
+     * for packages that pick the connection from coroutine context; must not keep request state in
+     * statics.
+     *
+     * @param (Closure(): (string|array<string, mixed>|ConnectionConfig|null))|null $resolver
+     */
+    public static function resolveDefaultUsing(?Closure $resolver): void
+    {
+        self::resolver()->setDefaultResolver($resolver);
+    }
+
+    /** Serve some connection configs from another pool (asked first, in order). See LeaseProvider. */
+    public static function addLeaseProvider(LeaseProvider $provider): void
+    {
+        self::resolver()->addLeaseProvider($provider);
+    }
+
+    public static function removeLeaseProvider(LeaseProvider $provider): void
+    {
+        self::resolver()->removeLeaseProvider($provider);
+    }
+
+    /**
+     * ORM pool counters: totals, or open/active/idle/waiting for one spec.
      *
      * @param string|array<string, mixed>|ConnectionConfig|null $spec
      * @return array<string, int>
@@ -105,8 +130,8 @@ final class Orm
      * the current coroutine (models, builders, Orm::table()) runs on it. release() is idempotent;
      * exceptions do not release it — use try/finally, or Orm::using().
      *
-     *   $c = Orm::acquire($tenant);
-     *   try { $c->table('users')->count(); User::on($tenant)->find(1); } finally { $c->release(); }
+     *   $c = Orm::acquire($shop);
+     *   try { $c->table('users')->count(); User::on($shop)->find(1); } finally { $c->release(); }
      *
      * @param string|array<string, mixed>|ConnectionConfig|null $spec
      */
@@ -159,7 +184,7 @@ final class Orm
 
     /**
      * Handle for a connection spec: name, config array, DSN / URL, ConnectionConfig, or null
-     * (current tenant scope, else default). A new handle every call; holds no PDO.
+     * (the default resolver if set, else the default connection). A new handle every call; holds no PDO.
      *
      * @param string|array<string, mixed>|ConnectionConfig|null $spec
      */
@@ -171,7 +196,7 @@ final class Orm
     }
 
     /**
-     * The resolved connection config for a spec (null = current Orm::tenant() scope, else the
+     * The resolved connection config for a spec (null = the default resolver if set, else the
      * default connection) — prefix(), engine(), charset(), collation(), database() … Resolved on
      * every call, never cached.
      *
@@ -182,7 +207,7 @@ final class Orm
         return self::resolver()->spec($spec);
     }
 
-    /** Table prefix of a connection (null = current tenant scope, else default). @param string|array<string, mixed>|ConnectionConfig|null $spec */
+    /** Table prefix of a connection (null = the default resolver / default connection). @param string|array<string, mixed>|ConnectionConfig|null $spec */
     public static function prefix(string|array|ConnectionConfig|null $spec = null): string
     {
         return self::config($spec)->prefix();
@@ -222,36 +247,6 @@ final class Orm
     public static function transaction(callable $callback, string|array|ConnectionConfig|null $spec = null, int $attempts = 1): mixed
     {
         return self::connection($spec)->transaction($callback, $attempts);
-    }
-
-    /**
-     * Run $callback with $spec as the default connection of THIS coroutine (models without an
-     * explicit connection, Orm::connection(null), Orm::table()). Context-local, restored on exit,
-     * invisible to other coroutines — including coroutines started inside (use Orm::go()).
-     *
-     * @template T
-     * @param string|array<string, mixed>|ConnectionConfig $spec
-     * @param callable(): T $callback
-     * @return T
-     */
-    public static function tenant(string|array|ConnectionConfig $spec, callable $callback): mixed
-    {
-        return Context::with(ConnectionResolver::TENANT_KEY, self::resolver()->spec($spec), $callback);
-    }
-
-    public static function currentTenant(): ?ConnectionConfig
-    {
-        $t = Context::get(ConnectionResolver::TENANT_KEY);
-
-        return $t instanceof ConnectionConfig ? $t : null;
-    }
-
-    /** Coroutine::create() that carries the current tenant scope into the new coroutine. */
-    public static function go(callable $callback): int|false
-    {
-        $tenant = self::currentTenant();
-
-        return Coroutine::create(static fn () => $tenant !== null ? self::tenant($tenant, $callback) : $callback());
     }
 
     /**
