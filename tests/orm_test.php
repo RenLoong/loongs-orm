@@ -70,14 +70,14 @@ $DBS = ['t1' => 'loongs_orm_t1', 't2' => 'loongs_orm_t2', 't3' => 'loongs_orm_t3
 
 // Three databases, three different spec forms: config array, URL DSN, PDO DSN (+credentials).
 $T = [
-    't1' => ['driver' => 'mysql', 'unix_socket' => $SOCK, 'database' => $DBS['t1'], 'username' => $USER, 'password' => $PASS],
-    't2' => sprintf('mysql://%s:%s@localhost/%s?unix_socket=%s', rawurlencode($USER), rawurlencode($PASS), $DBS['t2'], rawurlencode($SOCK)),
-    't3' => ConnectionConfig::fromDsn(sprintf('mysql:unix_socket=%s;dbname=%s;charset=utf8mb4', $SOCK, $DBS['t3']), $USER, $PASS),
+    't1' => ['driver' => 'mysql', 'unix_socket' => $SOCK, 'database' => $DBS['t1'], 'username' => $USER, 'password' => $PASS, 'prefix' => ''],
+    't2' => sprintf('mysql://%s:%s@localhost/%s?unix_socket=%s&prefix=', rawurlencode($USER), rawurlencode($PASS), $DBS['t2'], rawurlencode($SOCK)),
+    't3' => ConnectionConfig::adhoc(['driver' => 'mysql', 'unix_socket' => $SOCK, 'database' => $DBS['t3'], 'username' => $USER, 'password' => $PASS, 'charset' => 'utf8mb4', 'prefix' => '']),
 ];
 Orm::configure([
     'default' => 'central',
     'connections' => [
-        'central' => ['driver' => 'mysql', 'unix_socket' => $SOCK, 'database' => $DBS['central'], 'username' => $USER, 'password' => $PASS,
+        'central' => ['driver' => 'mysql', 'unix_socket' => $SOCK, 'database' => $DBS['central'], 'username' => $USER, 'password' => $PASS, 'prefix' => '',
             'pool' => ['size' => 4, 'wait_timeout' => 5.0]],
         // named connection with a table prefix (section 18)
         'prefixed' => ['driver' => 'mysql', 'unix_socket' => $SOCK, 'database' => 'loongs_orm_px', 'username' => $USER, 'password' => $PASS, 'prefix' => 'n_',
@@ -1249,6 +1249,8 @@ $main = function () use (&$events, &$warnings, $T, $DBS, $admin, $schema, $mode,
         check('config API: prefix / engine / charset / collation kept; URL ?prefix=; named; default scope; invalid prefix rejected',
             Orm::config($PA)->tableOptions() === ['prefix' => 'a_', 'engine' => 'InnoDB', 'charset' => 'utf8mb4', 'collation' => 'utf8mb4_unicode_ci']
             && Orm::prefix($PB) === 'b_' && Orm::prefix('prefixed') === 'n_' && Orm::prefix($T['t1']) === '' && Orm::prefix() === ''
+            && Orm::prefix(['driver' => 'mysql', 'database' => 'x']) === 'lgs_'
+            && Orm::prefix(['driver' => 'mysql', 'database' => 'x', 'prefix' => '']) === ''
             && withDefault($PB, static fn () => Orm::prefix() . '|' . Orm::tableName('users') . '|' . Orm::connection()->wrapTable('users')) === 'b_|b_users|`b_users`'
             && Orm::connection($PA)->prefix() === 'a_' && Orm::connection('prefixed')->tableName('plans') === 'n_plans' && $bad === 'rejected',
             json_encode(Orm::config($PA)->tableOptions()) . " invalid={$bad}");

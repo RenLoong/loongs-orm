@@ -317,6 +317,8 @@ through rows are excluded when the through model uses `SoftDeletes`.
 
 ## Table prefixes
 
+**Default table prefix is `lgs_`** when the connection config omits the `prefix` key. Set `'prefix' => ''` explicitly to disable. Explicit non-empty values (e.g. `shop_`) override the default.
+
 Every connection (named in `config/database.php`, ad-hoc array, URL `mysql://u:p@h/db?prefix=app_&engine=InnoDB`,
 `ConnectionConfig`) may carry `prefix` (`[A-Za-z0-9_]`, max 64), plus `engine`, `charset`, `collation`. The prefix is
 applied by the grammar, so it works the same for the default connection, the framework pool, the ORM pool and

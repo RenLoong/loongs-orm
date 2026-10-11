@@ -120,10 +120,10 @@ final readonly class ConnectionConfig
         return (string) ($this->config['database'] ?? '');
     }
 
-    /** Table prefix ("" = none): prepended to every table name the query builder / models compile. */
+    /** Table prefix (default lgs_ when key absent; "" = none): prepended to every table name the query builder / models compile. */
     public function prefix(): string
     {
-        return (string) ($this->config['prefix'] ?? '');
+        return (string) ($this->config['prefix'] ?? 'lgs_');
     }
 
     /** Prefixed table name (unquoted), e.g. table('users') → "app_users". */
@@ -231,7 +231,8 @@ final readonly class ConnectionConfig
         }
         $out['charset'] = self::identifier('charset', $out['charset']);
         // table prefix / engine: kept (normalised connection configs used to drop them)
-        $prefix = (string) ($c['prefix'] ?? '');
+        // Absent key -> default "lgs_"; explicit "" means no prefix.
+        $prefix = array_key_exists('prefix', $c) ? (string) $c['prefix'] : 'lgs_';
         if (preg_match('/^[A-Za-z0-9_]{0,64}$/', $prefix) !== 1) {
             throw new InvalidArgumentException('Connection "prefix" may only contain [A-Za-z0-9_] (max 64).');
         }
