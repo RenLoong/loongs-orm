@@ -3,7 +3,14 @@
     "description": "loong-swoole ORM — Eloquent-style query builder, models and relations; connection chosen per call (name, config array, DSN), always pooled, coroutine-safe",
     "type": "library",
     "license": "MIT",
-    "keywords": ["orm", "active-record", "query-builder", "connection-pool", "swoole", "loongs"],
+    "keywords": [
+        "orm",
+        "active-record",
+        "query-builder",
+        "connection-pool",
+        "swoole",
+        "loongs"
+    ],
     "require": {
         "php": "^8.4",
         "ext-pdo": "*",
@@ -21,7 +28,14 @@
         }
     },
     "scripts": {
-        "test": "php -d disable_functions= tests/orm_test.php cli && php -d disable_functions= tests/orm_test.php co"
+        "test": "php -d disable_functions= tests/orm_test.php cli && php -d disable_functions= tests/orm_test.php co",
+        "publish-config": "@php bin/publish-config.php",
+        "post-install-cmd": [
+            "@publish-config"
+        ],
+        "post-update-cmd": [
+            "@publish-config"
+        ]
     },
     "minimum-stability": "dev",
     "prefer-stable": true

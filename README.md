@@ -54,18 +54,18 @@ Orm::configure(['default' => 'mysql', 'connections' => ['mysql' => [
 final class User extends Model
 {
     use SoftDeletes;
-    protected array $fillable = ['name', 'email', 'settings', 'is_admin', 'status'];
+    protected array $fillable = ['name', 'email', 'settings', 'is_uuims', 'status'];
     protected array $hidden = ['password'];
     protected function casts(): array
     {
-        return ['settings' => 'array', 'is_admin' => 'bool', 'status' => Status::class, 'score' => 'decimal:2'];
+        return ['settings' => 'array', 'is_uuims' => 'bool', 'status' => Status::class, 'score' => 'decimal:2'];
     }
     public function posts(): HasMany { return $this->hasMany(Post::class); }
-    public function scopeAdmins(Builder $q): void { $q->where('is_admin', true); }
+    public function scopeUsers(Builder $q): void { $q->where('is_uuims', true); }
 }
 
 $u = User::create(['name' => 'ann', 'settings' => ['theme' => 'dark']]);
-$admins = User::admins()->with('posts')->orderBy('name')->paginate(20, page: 2);
+$users = User::users()->with('posts')->orderBy('name')->paginate(20, page: 2);
 Orm::table('users')->where('score', '>', 10)->count();
 ```
 
@@ -404,3 +404,7 @@ Defaults are unchanged (size 8, 64 buckets, idle 60 s, ttl 600 s, wait 3 s, vali
 it was meant for plain ad-hoc connections.
 
 License: MIT
+
+## Project config
+
+On install into a Loongs app, missing `config/*.php` stubs from this package are copied into the project `config/` directory (never overwritten). The app root should run `bin/publish-loongs-configs.php` from Composer `post-autoload-dump` (see `loongs/uuims` / `loongs/loongs` templates).
